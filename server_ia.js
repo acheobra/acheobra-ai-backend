@@ -417,61 +417,43 @@ function normalizarImageSize(valor) {
   return permitidos.has(valor) ? valor : "1K";
 }
 
-function extrairImagemInteraction(data) {
-  if (data?.output_image?.data) {
-    return {
-      data: data.output_image.data,
-      mimeType:
-        data.output_image.mime_type ??
-        data.output_image.mimeType ??
-        "image/png",
-    };
-  }
+function extrairImagemGenerateContent(data) {
+  const candidates = data?.candidates;
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
 
-  const steps = Array.isArray(data?.steps) ? data.steps : [];
+  const parts = candidates[0]?.content?.parts;
+  if (!Array.isArray(parts)) return null;
 
-  for (const step of steps) {
-    if (step?.type !== "model_output" || !Array.isArray(step?.content)) {
-      continue;
-    }
+  for (const part of parts) {
+    const inlineData = part?.inlineData ?? part?.inline_data;
 
-    for (const bloco of step.content) {
-      if (bloco?.type === "image" && bloco?.data) {
-        return {
-          data: bloco.data,
-          mimeType:
-            bloco.mime_type ??
-            bloco.mimeType ??
-            "image/png",
-        };
-      }
+    if (inlineData?.data) {
+      return {
+        data: inlineData.data,
+        mimeType:
+          inlineData.mimeType ??
+          inlineData.mime_type ??
+          "image/png",
+      };
     }
   }
 
   return null;
 }
 
-function extrairTextoInteraction(data) {
-  if (typeof data?.output_text === "string" && data.output_text.trim()) {
-    return data.output_text.trim();
-  }
+function extrairTextoImagemGenerateContent(data) {
+  const candidates = data?.candidates;
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
 
-  const textos = [];
-  const steps = Array.isArray(data?.steps) ? data.steps : [];
+  const parts = candidates[0]?.content?.parts;
+  if (!Array.isArray(parts)) return null;
 
-  for (const step of steps) {
-    if (step?.type !== "model_output" || !Array.isArray(step?.content)) {
-      continue;
-    }
+  const textos = parts
+    .filter((part) => typeof part?.text === "string")
+    .map((part) => part.text.trim())
+    .filter(Boolean);
 
-    for (const bloco of step.content) {
-      if (bloco?.type === "text" && typeof bloco?.text === "string") {
-        textos.push(bloco.text.trim());
-      }
-    }
-  }
-
-  return textos.filter(Boolean).join("\n") || null;
+  return textos.length ? textos.join("\n") : null;
 }
 
 async function gerarImagemGemini({
@@ -480,22 +462,29 @@ async function gerarImagemGemini({
   aspectRatio = "1:1",
   imageSize = "1K",
 }) {
+  // A geração/edição usa generateContent, que retorna a imagem em
+  // candidates[0].content.parts[].inlineData.
   const endpoint =
-    "https://generativelanguage.googleapis.com/v1beta/interactions";
+    `https://generativelanguage.googleapis.com/v1beta/models/` +
+    `${encodeURIComponent(GEMINI_IMAGE_MODEL)}:generateContent`;
 
-  const input = [
-    ...referencias
-      .filter((a) => a.mimeType.startsWith("image/"))
-      .map((a) => ({
-        type: "image",
-        mime_type: a.mimeType,
-        data: a.base64,
-      })),
-    {
-      type: "text",
-      text: prompt,
-    },
-  ];
+  const parts = [];
+
+  // Imagens de referência para edição/transformação.
+  for (const arquivo of referencias) {
+    if (!arquivo.mimeType.startsWith("image/")) continue;
+
+    parts.push({
+      inlineData: {
+        mimeType: arquivo.mimeType,
+        data: arquivo.base64,
+      },
+    });
+  }
+
+  parts.push({
+    text: prompt,
+  });
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_IMAGEM_MS);
@@ -508,17 +497,21 @@ async function gerarImagemGemini({
         "x-goog-api-key": GEMINI_API_KEY,
       },
       body: JSON.stringify({
-        model: GEMINI_IMAGE_MODEL,
-        input,
-        response_format: [
-          { type: "text" },
+        contents: [
           {
-            type: "image",
-            mime_type: "image/png",
-            aspect_ratio: normalizarAspectRatio(aspectRatio),
-            image_size: normalizarImageSize(imageSize),
+            role: "user",
+            parts,
           },
         ],
+        generationConfig: {
+          responseModalities: ["TEXT", "IMAGE"],
+          responseFormat: {
+            image: {
+              aspectRatio: normalizarAspectRatio(aspectRatio),
+              imageSize: normalizarImageSize(imageSize),
+            },
+          },
+        },
       }),
       signal: controller.signal,
     });
@@ -540,7 +533,7 @@ async function gerarImagemGemini({
       };
     }
 
-    const imagem = extrairImagemInteraction(dados);
+    const imagem = extrairImagemGenerateContent(dados);
 
     if (!imagem?.data) {
       return {
@@ -554,7 +547,7 @@ async function gerarImagemGemini({
       sucesso: true,
       imagemBase64: imagem.data,
       mimeType: imagem.mimeType,
-      texto: extrairTextoInteraction(dados),
+      texto: extrairTextoImagemGenerateContent(dados),
       modelo: GEMINI_IMAGE_MODEL,
     };
   } finally {
@@ -581,6 +574,7 @@ app.get("/", (req, res) => {
       "arquivos_de_texto",
       "geracao_de_imagens",
       "edicao_de_imagens",
+      "download_de_imagens_no_app",
     ],
   });
 });
@@ -816,6 +810,8 @@ app.post("/ia/gerar-imagem", async (req, res) => {
       tipo: "imagem",
       imagemBase64: resultado.imagemBase64,
       mimeType: resultado.mimeType,
+      nomeArquivo: `jisa_${Date.now()}.${resultado.mimeType === "image/jpeg" ? "jpg" : "png"}`,
+      podeBaixar: true,
       resposta: resultado.texto,
       modelo: resultado.modelo,
     });
