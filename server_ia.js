@@ -504,13 +504,10 @@ async function gerarImagemGemini({
           },
         ],
         generationConfig: {
+          // O Gemini usa os padrões de imagem quando tamanho/proporção
+          // não são enviados. Isso evita o INVALID_ARGUMENT observado
+          // no responseFormat.image.aspectRatio / imageSize.
           responseModalities: ["TEXT", "IMAGE"],
-          responseFormat: {
-            image: {
-              aspectRatio: normalizarAspectRatio(aspectRatio),
-              imageSize: normalizarImageSize(imageSize),
-            },
-          },
         },
       }),
       signal: controller.signal,
