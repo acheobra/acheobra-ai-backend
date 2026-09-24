@@ -19,6 +19,18 @@ const GEMINI_FALLBACK_MODEL =
 const GEMINI_IMAGE_MODEL =
   process.env.GEMINI_IMAGE_MODEL || "gemini-3.1-flash-image";
 
+// Cloudflare Workers AI - inicialmente usado em rotas de teste.
+const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
+const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+
+const CLOUDFLARE_TEXT_MODEL =
+  process.env.CLOUDFLARE_TEXT_MODEL || "@cf/meta/llama-3.1-8b-instruct";
+
+const CLOUDFLARE_IMAGE_MODEL =
+  process.env.CLOUDFLARE_IMAGE_MODEL || "@cf/black-forest-labs/flux-1-schnell";
+
+const TIMEOUT_CLOUDFLARE_MS = 60000;
+
 const MAX_TENTATIVAS = 2;
 const TIMEOUT_GEMINI_MS = 20000;
 const TIMEOUT_IMAGEM_MS = 90000;
@@ -552,6 +564,119 @@ async function gerarImagemGemini({
   }
 }
 
+
+// ======================================================
+// CLOUDFLARE WORKERS AI - TESTES
+// ======================================================
+
+function cloudflareConfigurado() {
+  return Boolean(CLOUDFLARE_ACCOUNT_ID && CLOUDFLARE_API_TOKEN);
+}
+
+function endpointCloudflare(modelo) {
+  return (
+    `https://api.cloudflare.com/client/v4/accounts/` +
+    `${encodeURIComponent(CLOUDFLARE_ACCOUNT_ID)}/ai/run/` +
+    `${modelo}`
+  );
+}
+
+async function chamarCloudflare(modelo, body, timeoutMs = TIMEOUT_CLOUDFLARE_MS) {
+  if (!cloudflareConfigurado()) {
+    return {
+      sucesso: false,
+      status: 500,
+      erro: "Cloudflare Workers AI não configurado no Render.",
+      dados: null,
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resposta = await fetch(endpointCloudflare(modelo), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    const textoBruto = await resposta.text();
+    let dados = null;
+
+    try {
+      dados = JSON.parse(textoBruto);
+    } catch {
+      dados = null;
+    }
+
+    if (!resposta.ok || dados?.success === false) {
+      return {
+        sucesso: false,
+        status: resposta.status,
+        erro:
+          dados?.errors?.[0]?.message ||
+          dados?.messages?.[0]?.message ||
+          textoBruto ||
+          `Cloudflare respondeu HTTP ${resposta.status}.`,
+        dados,
+      };
+    }
+
+    return {
+      sucesso: true,
+      status: resposta.status,
+      dados,
+    };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      return {
+        sucesso: false,
+        status: 504,
+        erro: "A chamada ao Cloudflare Workers AI excedeu o tempo limite.",
+        dados: null,
+      };
+    }
+
+    return {
+      sucesso: false,
+      status: 500,
+      erro: error?.message || "Erro inesperado ao chamar o Cloudflare Workers AI.",
+      dados: null,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function extrairTextoCloudflare(dados) {
+  const result = dados?.result;
+
+  if (typeof result?.response === "string" && result.response.trim()) {
+    return result.response.trim();
+  }
+
+  if (typeof result === "string" && result.trim()) {
+    return result.trim();
+  }
+
+  return null;
+}
+
+function extrairImagemCloudflare(dados) {
+  const result = dados?.result;
+
+  if (typeof result?.image === "string" && result.image.trim()) {
+    return result.image.trim();
+  }
+
+  return null;
+}
+
 // ======================================================
 // ROTAS
 // ======================================================
@@ -584,7 +709,159 @@ app.get("/health", (req, res) => {
     modelo_principal: GEMINI_MODEL,
     modelo_fallback: GEMINI_FALLBACK_MODEL,
     modelo_imagem: GEMINI_IMAGE_MODEL,
+    cloudflare_configurado: cloudflareConfigurado(),
+    cloudflare_modelo_texto: CLOUDFLARE_TEXT_MODEL,
+    cloudflare_modelo_imagem: CLOUDFLARE_IMAGE_MODEL,
   });
+});
+
+// Teste temporário de autenticação e geração de texto no Cloudflare.
+// Não substitui ainda a rota principal da Jisa.
+app.get("/cloudflare/teste", async (req, res) => {
+  try {
+    if (!cloudflareConfigurado()) {
+      return res.status(500).json({
+        ok: false,
+        cloudflare: false,
+        erro:
+          "CLOUDFLARE_ACCOUNT_ID ou CLOUDFLARE_API_TOKEN não configurado no Render.",
+      });
+    }
+
+    const resultado = await chamarCloudflare(CLOUDFLARE_TEXT_MODEL, {
+      messages: [
+        {
+          role: "system",
+          content:
+            "Você é a Jisa IA, assistente de construção do Ache Obra. " +
+            "Responda sempre em português do Brasil.",
+        },
+        {
+          role: "user",
+          content:
+            "Responda somente: Cloudflare Workers AI conectado com sucesso.",
+        },
+      ],
+      max_tokens: 80,
+      temperature: 0.2,
+    });
+
+    if (!resultado.sucesso) {
+      console.error(
+        "[Cloudflare] Falha no teste de texto:",
+        resultado.status,
+        resultado.erro,
+        resultado.dados
+      );
+
+      return res.status(resultado.status || 502).json({
+        ok: false,
+        cloudflare: false,
+        status: resultado.status,
+        erro: resultado.erro,
+      });
+    }
+
+    const resposta = extrairTextoCloudflare(resultado.dados);
+
+    if (!resposta) {
+      return res.status(502).json({
+        ok: false,
+        cloudflare: true,
+        autenticado: true,
+        erro: "Cloudflare respondeu, mas não retornou texto.",
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      cloudflare: true,
+      autenticado: true,
+      modelo: CLOUDFLARE_TEXT_MODEL,
+      resposta,
+    });
+  } catch (error) {
+    console.error("Erro em /cloudflare/teste:", error);
+
+    return res.status(500).json({
+      ok: false,
+      cloudflare: false,
+      erro: "Erro interno ao testar o Cloudflare Workers AI.",
+    });
+  }
+});
+
+// Teste de geração de imagem pelo FLUX.
+// Também não altera ainda a rota de geração de imagens da Jisa.
+app.get("/cloudflare/teste-imagem", async (req, res) => {
+  try {
+    if (!cloudflareConfigurado()) {
+      return res.status(500).json({
+        ok: false,
+        cloudflare: false,
+        erro:
+          "CLOUDFLARE_ACCOUNT_ID ou CLOUDFLARE_API_TOKEN não configurado no Render.",
+      });
+    }
+
+    const resultado = await chamarCloudflare(
+      CLOUDFLARE_IMAGE_MODEL,
+      {
+        prompt:
+          "Um quarto moderno de 3 por 3 metros com cama de casal, " +
+          "interior residencial realista, iluminação natural, sem pessoas.",
+        steps: 4,
+      },
+      90000
+    );
+
+    if (!resultado.sucesso) {
+      console.error(
+        "[Cloudflare] Falha no teste de imagem:",
+        resultado.status,
+        resultado.erro,
+        resultado.dados
+      );
+
+      return res.status(resultado.status || 502).json({
+        ok: false,
+        cloudflare: false,
+        status: resultado.status,
+        erro: resultado.erro,
+      });
+    }
+
+    const imagemBase64 = extrairImagemCloudflare(resultado.dados);
+
+    if (!imagemBase64) {
+      return res.status(502).json({
+        ok: false,
+        cloudflare: true,
+        autenticado: true,
+        erro: "Cloudflare respondeu, mas não retornou a imagem esperada.",
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      cloudflare: true,
+      autenticado: true,
+      tipo: "imagem",
+      modelo: CLOUDFLARE_IMAGE_MODEL,
+      mimeType: "image/jpeg",
+      nomeArquivo: `jisa_cloudflare_teste_${Date.now()}.jpg`,
+      podeBaixar: true,
+      imagemBase64,
+    });
+  } catch (error) {
+    console.error("Erro em /cloudflare/teste-imagem:", error);
+
+    return res.status(500).json({
+      ok: false,
+      cloudflare: false,
+      erro: "Erro interno ao testar geração de imagem no Cloudflare.",
+    });
+  }
 });
 
 // Texto + arquivos
@@ -844,5 +1121,8 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Modelo fallback: ${GEMINI_FALLBACK_MODEL}`);
   console.log(`Modelo de imagem: ${GEMINI_IMAGE_MODEL}`);
   console.log(`Gemini configurado: ${GEMINI_API_KEY ? "SIM" : "NÃO"}`);
+  console.log(`Cloudflare configurado: ${cloudflareConfigurado() ? "SIM" : "NÃO"}`);
+  console.log(`Cloudflare texto: ${CLOUDFLARE_TEXT_MODEL}`);
+  console.log(`Cloudflare imagem: ${CLOUDFLARE_IMAGE_MODEL}`);
   console.log("==========================================");
 });
