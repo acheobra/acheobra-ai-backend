@@ -10,17 +10,17 @@ const PORT = process.env.PORT || 10000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 const GEMINI_MODEL =
-  process.env.GEMINI_MODEL || "gemini-3.8-flash";
+  process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
 const GEMINI_FALLBACK_MODEL =
-  process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash-lite";
+  process.env.GEMINI_FALLBACK_MODEL || "gemini-3.8-flash";
 
 // Modelo oficial separado para criação/edição de imagens.
 const GEMINI_IMAGE_MODEL =
   process.env.GEMINI_IMAGE_MODEL || "gemini-3.1-flash-image";
 
-const MAX_TENTATIVAS = 3;
-const TIMEOUT_GEMINI_MS = 45000;
+const MAX_TENTATIVAS = 2;
+const TIMEOUT_GEMINI_MS = 20000;
 const TIMEOUT_IMAGEM_MS = 90000;
 
 // Como arquivos são enviados em Base64, o JSON fica maior que o arquivo binário.
@@ -345,7 +345,7 @@ async function chamarGeminiComRetry(modelo, mensagem, arquivos = []) {
 
       if (resultado.status === 429 || resultado.status === 503) {
         if (tentativa < MAX_TENTATIVAS) {
-          const esperaMs = 2000 * Math.pow(2, tentativa - 1);
+          const esperaMs = 700 * Math.pow(2, tentativa - 1);
           await esperar(esperaMs);
           continue;
         }
@@ -371,7 +371,7 @@ async function chamarGeminiComRetry(modelo, mensagem, arquivos = []) {
     } catch (error) {
       if (error?.name === "AbortError") {
         if (tentativa < MAX_TENTATIVAS) {
-          const esperaMs = 2000 * Math.pow(2, tentativa - 1);
+          const esperaMs = 700 * Math.pow(2, tentativa - 1);
           await esperar(esperaMs);
           continue;
         }
