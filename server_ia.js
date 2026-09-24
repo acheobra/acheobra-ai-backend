@@ -19,7 +19,7 @@ const GEMINI_FALLBACK_MODEL =
 const GEMINI_IMAGE_MODEL =
   process.env.GEMINI_IMAGE_MODEL || "gemini-3.1-flash-image";
 
-// Cloudflare Workers AI - inicialmente usado em rotas de teste.
+// Cloudflare Workers AI - principal para conversa e geração de imagens.
 const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
 const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 
@@ -667,6 +667,96 @@ function extrairTextoCloudflare(dados) {
   return null;
 }
 
+async function conversarCloudflare(mensagem) {
+  const texto =
+    mensagem ||
+    "Olá. Apresente-se brevemente como Jisa IA, assistente do Ache Obra.";
+
+  const resultado = await chamarCloudflare(CLOUDFLARE_TEXT_MODEL, {
+    messages: [
+      {
+        role: "system",
+        content: INSTRUCAO_SISTEMA,
+      },
+      {
+        role: "user",
+        content: texto,
+      },
+    ],
+    max_tokens: 2000,
+    temperature: 0.7,
+  });
+
+  if (!resultado.sucesso) {
+    return {
+      sucesso: false,
+      status: resultado.status,
+      erro: resultado.erro,
+      detalhes: resultado.dados,
+      modelo: CLOUDFLARE_TEXT_MODEL,
+    };
+  }
+
+  const resposta = extrairTextoCloudflare(resultado.dados);
+
+  if (!resposta) {
+    return {
+      sucesso: false,
+      status: 502,
+      erro: "Cloudflare respondeu sem texto.",
+      detalhes: resultado.dados,
+      modelo: CLOUDFLARE_TEXT_MODEL,
+    };
+  }
+
+  return {
+    sucesso: true,
+    resposta,
+    modelo: CLOUDFLARE_TEXT_MODEL,
+  };
+}
+
+async function gerarImagemCloudflare(prompt) {
+  const resultado = await chamarCloudflare(
+    CLOUDFLARE_IMAGE_MODEL,
+    {
+      prompt,
+      steps: 4,
+    },
+    90000
+  );
+
+  if (!resultado.sucesso) {
+    return {
+      sucesso: false,
+      status: resultado.status,
+      erro: resultado.erro,
+      detalhes: resultado.dados,
+      modelo: CLOUDFLARE_IMAGE_MODEL,
+    };
+  }
+
+  const imagemBase64 = extrairImagemCloudflare(resultado.dados);
+
+  if (!imagemBase64) {
+    return {
+      sucesso: false,
+      status: 502,
+      erro: "Cloudflare respondeu sem imagem.",
+      detalhes: resultado.dados,
+      modelo: CLOUDFLARE_IMAGE_MODEL,
+    };
+  }
+
+  return {
+    sucesso: true,
+    imagemBase64,
+    mimeType: "image/jpeg",
+    texto: null,
+    modelo: CLOUDFLARE_IMAGE_MODEL,
+  };
+}
+
 function extrairImagemCloudflare(dados) {
   const result = dados?.result;
 
@@ -712,6 +802,9 @@ app.get("/health", (req, res) => {
     cloudflare_configurado: cloudflareConfigurado(),
     cloudflare_modelo_texto: CLOUDFLARE_TEXT_MODEL,
     cloudflare_modelo_imagem: CLOUDFLARE_IMAGE_MODEL,
+    conversa_principal: cloudflareConfigurado() ? "cloudflare" : "gemini",
+    geracao_imagem_principal: cloudflareConfigurado() ? "cloudflare" : "indisponivel",
+    analise_arquivos: GEMINI_API_KEY ? "gemini" : "indisponivel",
   });
 });
 
@@ -865,15 +958,10 @@ app.get("/cloudflare/teste-imagem", async (req, res) => {
 });
 
 // Texto + arquivos
+// Texto puro: Cloudflare é o provedor principal e Gemini é fallback.
+// Arquivos/imagens/documentos: Gemini continua responsável pela análise multimodal.
 app.post("/ia/perguntar", async (req, res) => {
   try {
-    if (!GEMINI_API_KEY) {
-      return res.status(500).json({
-        ok: false,
-        erro: "Serviço de IA não configurado.",
-      });
-    }
-
     const mensagem =
       typeof req.body?.mensagem === "string"
         ? req.body.mensagem.trim()
@@ -908,6 +996,40 @@ app.post("/ia/perguntar", async (req, res) => {
       `[Jisa IA] texto=${mensagem ? "SIM" : "NÃO"} arquivos=${arquivos.length}`
     );
 
+    // Conversa comum: Cloudflare primeiro.
+    if (arquivos.length === 0 && cloudflareConfigurado()) {
+      console.log(`[Cloudflare] Conversa usando ${CLOUDFLARE_TEXT_MODEL}`);
+
+      const resultadoCloudflare = await conversarCloudflare(mensagem);
+
+      if (resultadoCloudflare.sucesso) {
+        return res.status(200).json({
+          ok: true,
+          resposta: resultadoCloudflare.resposta,
+          modelo: resultadoCloudflare.modelo,
+          provedor: "cloudflare",
+          fallback: false,
+        });
+      }
+
+      console.error(
+        "[Cloudflare] Falha na conversa; tentando Gemini:",
+        resultadoCloudflare.status,
+        resultadoCloudflare.erro
+      );
+    }
+
+    // Arquivos ou fallback de texto: Gemini.
+    if (!GEMINI_API_KEY) {
+      return res.status(503).json({
+        ok: false,
+        erro:
+          arquivos.length > 0
+            ? "A análise de arquivos está temporariamente indisponível."
+            : "A Jisa está temporariamente indisponível.",
+      });
+    }
+
     const resultadoPrincipal = await chamarGeminiComRetry(
       GEMINI_MODEL,
       mensagem,
@@ -919,7 +1041,8 @@ app.post("/ia/perguntar", async (req, res) => {
         ok: true,
         resposta: resultadoPrincipal.resposta,
         modelo: resultadoPrincipal.modelo,
-        fallback: false,
+        provedor: "gemini",
+        fallback: arquivos.length === 0 && cloudflareConfigurado(),
       });
     }
 
@@ -956,6 +1079,7 @@ app.post("/ia/perguntar", async (req, res) => {
         ok: true,
         resposta: resultadoFallback.resposta,
         modelo: resultadoFallback.modelo,
+        provedor: "gemini",
         fallback: true,
       });
     }
@@ -989,16 +1113,11 @@ app.post("/ia/perguntar", async (req, res) => {
 });
 
 // Geração e edição de imagem.
-// Para edição, envie imagens de referência no mesmo formato de "arquivos".
+// Geração do zero: Cloudflare FLUX é o provedor principal.
+// Edição com imagem de referência: mantém Gemini, pois o modelo FLUX usado aqui
+// foi validado para geração por prompt, não para edição de referência.
 app.post("/ia/gerar-imagem", async (req, res) => {
   try {
-    if (!GEMINI_API_KEY) {
-      return res.status(500).json({
-        ok: false,
-        erro: "Serviço de IA não configurado.",
-      });
-    }
-
     const prompt =
       typeof req.body?.prompt === "string"
         ? req.body.prompt.trim()
@@ -1044,27 +1163,37 @@ app.post("/ia/gerar-imagem", async (req, res) => {
       });
     }
 
-    const resultado = await gerarImagemGemini({
-      prompt,
-      referencias,
-      aspectRatio:
-        typeof req.body?.aspectRatio === "string"
-          ? req.body.aspectRatio
-          : "1:1",
-      imageSize:
-        typeof req.body?.imageSize === "string"
-          ? req.body.imageSize
-          : "1K",
-    });
+    // Sem referência: usa Cloudflare FLUX, já validado no ambiente.
+    if (referencias.length === 0 && cloudflareConfigurado()) {
+      console.log(`[Cloudflare] Gerando imagem com ${CLOUDFLARE_IMAGE_MODEL}`);
 
-    if (!resultado.sucesso) {
+      const resultadoCloudflare = await gerarImagemCloudflare(prompt);
+
+      if (resultadoCloudflare.sucesso) {
+        return res.status(200).json({
+          ok: true,
+          tipo: "imagem",
+          imagemBase64: resultadoCloudflare.imagemBase64,
+          mimeType: resultadoCloudflare.mimeType,
+          nomeArquivo: `jisa_${Date.now()}.jpg`,
+          podeBaixar: true,
+          resposta: resultadoCloudflare.texto,
+          modelo: resultadoCloudflare.modelo,
+          provedor: "cloudflare",
+          fallback: false,
+        });
+      }
+
       console.error(
-        "[Jisa IA] Falha na geração de imagem:",
-        resultado.status,
-        resultado.detalhes
+        "[Cloudflare] Falha na geração de imagem:",
+        resultadoCloudflare.status,
+        resultadoCloudflare.erro,
+        resultadoCloudflare.detalhes
       );
 
-      if (resultado.status === 429) {
+      // Não envia automaticamente para o Gemini de imagem quando o Cloudflare
+      // falha, evitando consumo/cobrança inesperada e o erro de quota 0 já visto.
+      if (resultadoCloudflare.status === 429) {
         return res.status(429).json({
           ok: false,
           erro:
@@ -1079,15 +1208,66 @@ app.post("/ia/gerar-imagem", async (req, res) => {
       });
     }
 
-    return res.status(200).json({
-      ok: true,
-      tipo: "imagem",
-      imagemBase64: resultado.imagemBase64,
-      mimeType: resultado.mimeType,
-      nomeArquivo: `jisa_${Date.now()}.${resultado.mimeType === "image/jpeg" ? "jpg" : "png"}`,
-      podeBaixar: true,
-      resposta: resultado.texto,
-      modelo: resultado.modelo,
+    // Edição com imagem de referência: Gemini.
+    if (referencias.length > 0) {
+      if (!GEMINI_API_KEY) {
+        return res.status(503).json({
+          ok: false,
+          erro: "A edição de imagens está temporariamente indisponível.",
+        });
+      }
+
+      const resultado = await gerarImagemGemini({
+        prompt,
+        referencias,
+        aspectRatio:
+          typeof req.body?.aspectRatio === "string"
+            ? req.body.aspectRatio
+            : "1:1",
+        imageSize:
+          typeof req.body?.imageSize === "string"
+            ? req.body.imageSize
+            : "1K",
+      });
+
+      if (!resultado.sucesso) {
+        console.error(
+          "[Jisa IA] Falha na edição de imagem pelo Gemini:",
+          resultado.status,
+          resultado.detalhes
+        );
+
+        if (resultado.status === 429) {
+          return res.status(429).json({
+            ok: false,
+            erro:
+              "A edição de imagens atingiu o limite disponível neste momento.",
+          });
+        }
+
+        return res.status(502).json({
+          ok: false,
+          erro: "Não foi possível editar a imagem neste momento.",
+        });
+      }
+
+      return res.status(200).json({
+        ok: true,
+        tipo: "imagem",
+        imagemBase64: resultado.imagemBase64,
+        mimeType: resultado.mimeType,
+        nomeArquivo: `jisa_${Date.now()}.${resultado.mimeType === "image/jpeg" ? "jpg" : "png"}`,
+        podeBaixar: true,
+        resposta: resultado.texto,
+        modelo: resultado.modelo,
+        provedor: "gemini",
+        fallback: false,
+      });
+    }
+
+    return res.status(503).json({
+      ok: false,
+      erro: "O serviço de geração de imagens não está configurado.",
     });
   } catch (error) {
     if (error?.name === "AbortError") {
