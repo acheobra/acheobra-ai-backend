@@ -54,6 +54,9 @@ REGRAS DE QUALIDADE
 - REGRA EXECUTAR PRIMEIRO: quando houver informação suficiente para produzir uma resposta, proposta, estimativa ou imagem útil, execute usando suposições razoáveis para detalhes secundários.
 - Faça pergunta somente quando faltar uma informação realmente essencial que impeça a execução. Nunca reinicie um levantamento de requisitos se o histórico já contiver as respostas.
 - Correções curtas como "mais realista", "de verdade", "igual à anterior", "mude só o telhado", "agora faça a imagem" e "conforme pedi" são continuação do trabalho anterior; preserve tudo que não foi explicitamente alterado.
+- HIERARQUIA DE CONTEXTO: a mensagem atual do usuário tem prioridade máxima. Depois vêm as correções mais recentes e, por último, o histórico antigo. O histórico serve para completar o pedido atual, nunca para trocar seu assunto principal.
+- Se o usuário fizer um pedido executável, execute. Não responda com apresentação genérica, lista de capacidades ou perguntas desnecessárias.
+- Aprenda dentro da conversa: quando o usuário corrigir um resultado, considere essa correção uma preferência/requisito vigente nas próximas mensagens relacionadas, até que ele diga o contrário.
 - Quando o usuário pedir uma estimativa, deixe claro o que é estimado e quais fatores podem alterar o resultado.
 - Em cálculos, organize os dados, confira unidades e mostre o resultado de maneira compreensível.
 - Se o usuário corrigir algo, priorize a correção mais recente.
@@ -824,17 +827,30 @@ function normalizarTextoBusca(valor) {
 function detectarTipoImagem(prompt) {
   const t = normalizarTextoBusca(prompt);
 
-  if (/planta baixa|floor plan|repartic|divis(ao|oes)|distribuicao.*(comodo|ambiente)|layout.*casa/.test(t)) {
+  // A intenção explícita da mensagem atual sempre vence o histórico.
+  if (/\b(planta baixa|floor plan|planta da casa|planta do imovel|planta do imóvel|layout da casa|distribuicao dos comodos|distribuição dos cômodos)\b/.test(t)) {
     return "planta_baixa";
   }
-  if (/fachada|frente da casa|exterior da casa|elevacao frontal/.test(t)) {
+  if (/\b(fachada|frente da casa|frente do imovel|exterior da casa|vista externa|elevacao frontal)\b/.test(t)) {
     return "fachada";
   }
-  if (/cozinha|quarto|banheiro|sala|lavanderia|escritorio|interior|ambiente interno/.test(t)) {
+  if (/\b(telhado|cobertura)\b/.test(t) && !/\b(casa|residencia|imovel|sobrado|cabana|chale)\b/.test(t)) {
+    return "cobertura";
+  }
+  if (/\b(jardim|paisag|area externa|quintal)\b/.test(t) && !/\b(casa|residencia|imovel|sobrado|cabana|chale)\b/.test(t)) {
+    return "area_externa";
+  }
+
+  // Se o pedido fala da edificação como objeto principal, não deixe nomes de
+  // cômodos no contexto transformarem a geração em uma imagem de interior.
+  if (/\b(casa|residencia|imovel|sobrado|cabana|chale|edificacao|construcao)\b/.test(t)) {
+    return "edificacao_externa";
+  }
+
+  if (/\b(interior|ambiente interno|por dentro|dentro da casa|cozinha|quarto|banheiro|sala|lavanderia|escritorio)\b/.test(t)) {
     return "interior";
   }
-  if (/telhado|cobertura/.test(t)) return "cobertura";
-  if (/jardim|paisag|area externa|quintal/.test(t)) return "area_externa";
+
   return "geral";
 }
 
@@ -843,15 +859,19 @@ function extrairRequisitosVisuais(prompt) {
   const t = normalizarTextoBusca(texto);
   const requisitos = [];
 
-  const dimensoes = t.match(/\b\d+(?:[.,]\d+)?\s*(?:m|metro|metros)?\s*[xX×]\s*\d+(?:[.,]\d+)?\s*(?:m|metro|metros)?\b/i);
+  const dimensoes = t.match(/\b\d+(?:[.,]\d+)?\s*(?:m|metro|metros)?\s*[x×]\s*\d+(?:[.,]\d+)?\s*(?:m|metro|metros)?\b/i);
   if (dimensoes) requisitos.push(`Dimensões mencionadas pelo usuário: ${dimensoes[0]}.`);
+
+  const materiais = ["madeira", "alvenaria", "tijolo", "concreto", "vidro", "pedra", "metal"];
+  for (const material of materiais) {
+    if (t.includes(material)) requisitos.push(`Material explicitamente citado: ${material}.`);
+  }
 
   const termos = [
     "quarto", "suite", "banheiro", "lavabo", "sala", "cozinha", "lavanderia",
     "garagem", "escritorio", "closet", "despensa", "varanda", "corredor",
-    "area gourmet", "churrasqueira", "jardim", "piscina"
+    "area gourmet", "churrasqueira", "jardim", "piscina", "porta", "janela"
   ];
-
   for (const termo of termos) {
     if (t.includes(termo)) requisitos.push(`Preservar o requisito citado: ${termo}.`);
   }
@@ -859,82 +879,118 @@ function extrairRequisitosVisuais(prompt) {
   return requisitos;
 }
 
-function enriquecerPromptImagem(prompt) {
-  const original = String(prompt || "").trim();
-  const tipo = detectarTipoImagem(original);
-  const requisitos = extrairRequisitosVisuais(original);
+function pedidoEhContinuacaoVisual(prompt) {
+  const t = normalizarTextoBusca(prompt);
+  return /\b(ela|ele|essa|esse|esta|este|isso|anterior|antes|mesma|mesmo|de verdade|mais realista|realista|conforme pedi|como pedi|igual a anterior|refaca|refazer|mude|troque|altere|adicione|adicione|coloque|retire|remova|agora)\b/.test(t);
+}
+
+function historicoVisualRelevante(historico = [], limite = 8) {
+  return historico
+    .filter((item) => item && ["user", "assistant"].includes(item.role) && item.content)
+    .slice(-limite)
+    .map((item) => `${item.role === "user" ? "Usuário" : "Jisa"}: ${item.content}`)
+    .join("\n");
+}
+
+function montarPromptImagemInteligente(promptAtual, historico = []) {
+  const atual = String(promptAtual || "").trim();
+  const tipoAtual = detectarTipoImagem(atual);
+  const continuacao = pedidoEhContinuacaoVisual(atual);
+  const contexto = historicoVisualRelevante(historico);
+  const requisitos = extrairRequisitosVisuais(atual);
+  const t = normalizarTextoBusca(atual);
 
   const base = [
-    "Crie uma única imagem que cumpra fielmente o pedido do usuário.",
-    "PRIORIDADE MÁXIMA: respeitar todos os elementos, quantidades, relações espaciais, dimensões e restrições explicitamente solicitados.",
-    "Não substitua o assunto principal por um detalhe isolado. Não omita elementos essenciais do pedido.",
-    "Mantenha composição clara, coerente e imediatamente compreensível.",
+    "TAREFA: gerar UMA imagem que represente fielmente o pedido atual do usuário.",
+    "REGRA DE PRIORIDADE: 1) pedido atual; 2) correções recentes; 3) histórico antigo.",
+    "O histórico NUNCA pode mudar o assunto principal explicitamente pedido na mensagem atual.",
+    "Não responda com texto, não faça perguntas e não transforme o pedido em outro tipo de cena.",
+    "PEDIDO ATUAL (FONTE PRINCIPAL):",
+    atual,
   ];
 
-  if (/\b(de verdade|realista|fotorealista|foto real|pareca real|parecer real|construcao real|casa real)\b/.test(normalizarTextoBusca(original))) {
+  if (continuacao && contexto) {
     base.push(
-      "ESTILO OBRIGATÓRIO: aparência fotográfica arquitetônica realista, construção em escala real, materiais fisicamente plausíveis, iluminação natural e proporções residenciais críveis.",
-      "NÃO gerar maquete, miniatura, diorama, brinquedo, dollhouse, modelinho 3D ou aparência de objeto em escala reduzida."
+      "CONTEXTO ANTERIOR RELEVANTE (usar apenas para preservar o que não foi alterado):",
+      contexto,
+      "A mensagem atual é uma continuação/correção. Preserve requisitos anteriores compatíveis e altere somente o solicitado."
+    );
+  } else if (contexto) {
+    base.push(
+      "CONTEXTO ANTERIOR SECUNDÁRIO:",
+      contexto,
+      "Use este contexto somente se for compatível com o pedido atual. Ignore qualquer trecho que conflite com o assunto atual."
     );
   }
 
-  if (tipo === "planta_baixa") {
+  base.push(
+    "QUALIDADE VISUAL: composição coerente, objeto principal claramente visível, proporções plausíveis e sem elementos aleatórios que contradigam o pedido."
+  );
+
+  if (tipoAtual === "edificacao_externa") {
     base.push(
-      "TIPO VISUAL OBRIGATÓRIO: planta baixa residencial completa, vista superior ortográfica 2D (top-down), como estudo preliminar arquitetônico.",
-      "MOSTRAR O IMÓVEL INTEIRO dentro do enquadramento, com perímetro externo, paredes internas, divisórias, portas, janelas e circulação legíveis.",
-      "Mostrar TODOS os ambientes solicitados simultaneamente e claramente separados. A imagem não pode mostrar somente um cômodo.",
-      "Evitar perspectiva de câmera ao nível dos olhos, fotografia de interior, close de ambiente, fachada externa e cortes que escondam parte da residência.",
-      "Priorizar a organização espacial e a leitura das repartições acima de decoração, mobiliário ou efeitos artísticos.",
-      "Se houver móveis, usar apenas mobiliário simples em vista superior para ajudar a identificar os ambientes, sem esconder paredes e circulação.",
-      "Não inventar cômodos adicionais quando o usuário especificar uma lista de ambientes.",
-      "Não tratar esta imagem como projeto executivo: ela é uma representação visual conceitual da distribuição solicitada."
+      "TIPO VISUAL OBRIGATÓRIO: vista EXTERNA da edificação completa.",
+      "Mostrar a casa/residência inteira no enquadramento, incluindo fachada, paredes externas, cobertura e aberturas visíveis.",
+      "NÃO gerar sala, cozinha, quarto, banheiro ou outro ambiente interno como assunto principal.",
+      "NÃO gerar somente um detalhe isolado da construção.",
+      "Usar perspectiva arquitetônica externa natural, com escala residencial real."
     );
-  } else if (tipo === "fachada") {
+  } else if (tipoAtual === "planta_baixa") {
     base.push(
-      "TIPO VISUAL: fachada/exterior da edificação, enquadramento amplo mostrando a construção completa.",
-      "Preservar número de pavimentos, aberturas, garagem, materiais, cores e estilo citados pelo usuário.",
-      "Evitar transformar o pedido em cena interna ou mostrar apenas detalhes da fachada."
+      "TIPO VISUAL OBRIGATÓRIO: planta baixa residencial completa, vista superior ortográfica 2D (top-down).",
+      "Mostrar o imóvel inteiro, perímetro externo, paredes internas, divisórias, portas, janelas e circulação.",
+      "Mostrar todos os ambientes solicitados simultaneamente; não mostrar apenas um cômodo.",
+      "Evitar perspectiva ao nível dos olhos, fotografia de interior e fachada."
     );
-  } else if (tipo === "interior") {
+  } else if (tipoAtual === "fachada") {
     base.push(
-      "TIPO VISUAL: ambiente interno coerente com o cômodo solicitado.",
-      "Preservar dimensões, mobiliário, materiais, cores, aberturas e estilo mencionados.",
-      "Usar enquadramento suficientemente amplo para tornar a organização do ambiente compreensível."
+      "TIPO VISUAL OBRIGATÓRIO: fachada/exterior da edificação, enquadramento amplo mostrando a construção completa.",
+      "Não gerar interior. Preservar materiais, aberturas, pavimentos e características solicitadas."
     );
-  } else if (tipo === "cobertura") {
+  } else if (tipoAtual === "interior") {
     base.push(
-      "TIPO VISUAL: cobertura/telhado como assunto principal, com geometria geral claramente visível.",
-      "Evitar substituir a cobertura por uma cena interna ou por detalhe decorativo."
+      "TIPO VISUAL OBRIGATÓRIO: ambiente interno solicitado, com enquadramento amplo e organização compreensível.",
+      "Não trocar o cômodo solicitado por outro ambiente."
     );
-  } else if (tipo === "area_externa") {
+  } else if (tipoAtual === "cobertura") {
+    base.push("TIPO VISUAL OBRIGATÓRIO: cobertura/telhado como assunto principal e geometria claramente visível.");
+  } else if (tipoAtual === "area_externa") {
+    base.push("TIPO VISUAL OBRIGATÓRIO: área externa solicitada, mantendo relação coerente com a edificação.");
+  }
+
+  if (/\b(de verdade|realista|fotorealista|foto real|pareca real|parecer real|casa real|construcao real)\b/.test(t) || tipoAtual === "edificacao_externa") {
     base.push(
-      "TIPO VISUAL: área externa completa e coerente com os elementos solicitados.",
-      "Manter visíveis as relações entre edificação, circulação e elementos externos pedidos."
+      "ESTILO: fotografia arquitetônica realista, construção em escala real, materiais fisicamente plausíveis, iluminação natural e proporções críveis.",
+      "EVITAR: maquete, miniatura, diorama, dollhouse, brinquedo, modelinho, aparência toy-like ou construção em escala reduzida."
     );
   }
 
   if (requisitos.length) {
-    base.push("REQUISITOS DETECTADOS QUE NÃO DEVEM SER IGNORADOS:", ...requisitos);
+    base.push("REQUISITOS EXPLÍCITOS DA MENSAGEM ATUAL:", ...requisitos);
   }
 
-  base.push(
-    "PEDIDO ORIGINAL DO USUÁRIO (fonte principal; não alterar seu significado):",
-    original,
-    "Antes de gerar, confira internamente se a composição representa o pedido completo."
-  );
-
-  return { tipo, prompt: base.join("\n") };
+  base.push("Antes de gerar, confira internamente: o assunto principal da imagem corresponde exatamente ao pedido atual?");
+  return { tipo: tipoAtual, prompt: base.join("\n") };
 }
 
 async function gerarImagemCloudflare(prompt) {
-  const resultado = await chamarCloudflare(
-    CLOUDFLARE_IMAGE_MODEL,
-    {
-      prompt,
-      steps: 4,
-    },
-    90000
-  );
+  let resultado = null;
+
+  for (let tentativa = 1; tentativa <= 2; tentativa++) {
+    resultado = await chamarCloudflare(
+      CLOUDFLARE_IMAGE_MODEL,
+      { prompt, steps: 4 },
+      90000
+    );
+
+    if (resultado.sucesso) break;
+
+    const transitorio = [429, 500, 502, 503, 504].includes(resultado.status);
+    if (!transitorio || tentativa === 2) break;
+
+    console.warn(`[Cloudflare] Imagem falhou na tentativa ${tentativa}; tentando novamente. HTTP ${resultado.status}`);
+    await esperar(900);
+  }
 
   if (!resultado.sucesso) {
     return {
@@ -1381,8 +1437,7 @@ app.post("/ia/gerar-imagem", async (req, res) => {
 
     // Sem referência: usa Cloudflare FLUX, já validado no ambiente.
     if (referencias.length === 0 && cloudflareConfigurado()) {
-      const promptContextual = montarPromptImagemComContexto(prompt, historico);
-      const promptOtimizado = enriquecerPromptImagem(promptContextual);
+      const promptOtimizado = montarPromptImagemInteligente(prompt, historico);
 
       console.log(
         `[Cloudflare] Gerando imagem com ${CLOUDFLARE_IMAGE_MODEL} | tipo=${promptOtimizado.tipo}`
