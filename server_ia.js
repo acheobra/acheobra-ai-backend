@@ -892,94 +892,117 @@ function historicoVisualRelevante(historico = [], limite = 8) {
     .join("\n");
 }
 
+const MAX_PROMPT_FLUX_CARACTERES = 1900;
+
+function limitarTextoPorCaracteres(texto, maximo) {
+  const valor = String(texto || "").trim();
+  if (valor.length <= maximo) return valor;
+  return valor.slice(0, Math.max(0, maximo - 3)).trimEnd() + "...";
+}
+
+function contextoVisualCompacto(historico = [], promptAtual = "") {
+  if (!historico.length) return "";
+
+  const atualNormalizado = normalizarTextoBusca(promptAtual);
+  const partes = [];
+  let usados = 0;
+
+  // Para imagens, o histórico é apenas memória auxiliar. Priorizamos mensagens
+  // recentes do usuário e evitamos carregar respostas longas da própria Jisa.
+  for (let i = historico.length - 1; i >= 0 && usados < 4; i--) {
+    const item = historico[i];
+    if (!item || item.role !== "user" || !item.content) continue;
+
+    const conteudo = String(item.content).trim();
+    if (!conteudo) continue;
+    if (normalizarTextoBusca(conteudo) === atualNormalizado) continue;
+
+    partes.unshift(limitarTextoPorCaracteres(conteudo, 260));
+    usados++;
+  }
+
+  return partes.join(" | ");
+}
+
 function montarPromptImagemInteligente(promptAtual, historico = []) {
   const atual = String(promptAtual || "").trim();
   const tipoAtual = detectarTipoImagem(atual);
   const continuacao = pedidoEhContinuacaoVisual(atual);
-  const contexto = historicoVisualRelevante(historico);
+  const contexto = contextoVisualCompacto(historico, atual);
   const requisitos = extrairRequisitosVisuais(atual);
   const t = normalizarTextoBusca(atual);
 
-  const base = [
-    "TAREFA: gerar UMA imagem que represente fielmente o pedido atual do usuário.",
-    "REGRA DE PRIORIDADE: 1) pedido atual; 2) correções recentes; 3) histórico antigo.",
-    "O histórico NUNCA pode mudar o assunto principal explicitamente pedido na mensagem atual.",
-    "Não responda com texto, não faça perguntas e não transforme o pedido em outro tipo de cena.",
-    "PEDIDO ATUAL (FONTE PRINCIPAL):",
-    atual,
+  // O FLUX Schnell aceita prompt com no máximo 2048 caracteres. Mantemos
+  // margem de segurança e damos prioridade absoluta ao pedido atual.
+  const blocos = [
+    `PEDIDO ATUAL: ${limitarTextoPorCaracteres(atual, 700)}`,
   ];
 
   if (continuacao && contexto) {
-    base.push(
-      "CONTEXTO ANTERIOR RELEVANTE (usar apenas para preservar o que não foi alterado):",
-      contexto,
-      "A mensagem atual é uma continuação/correção. Preserve requisitos anteriores compatíveis e altere somente o solicitado."
-    );
-  } else if (contexto) {
-    base.push(
-      "CONTEXTO ANTERIOR SECUNDÁRIO:",
-      contexto,
-      "Use este contexto somente se for compatível com o pedido atual. Ignore qualquer trecho que conflite com o assunto atual."
+    blocos.push(
+      `CONTEXTO A PRESERVAR: ${limitarTextoPorCaracteres(contexto, 520)}`,
+      "É continuação/correção: mantenha o que não foi alterado pelo pedido atual."
     );
   }
 
-  base.push(
-    "QUALIDADE VISUAL: composição coerente, objeto principal claramente visível, proporções plausíveis e sem elementos aleatórios que contradigam o pedido."
-  );
-
   if (tipoAtual === "edificacao_externa") {
-    base.push(
-      "TIPO VISUAL OBRIGATÓRIO: vista EXTERNA da edificação completa.",
-      "Mostrar a casa/residência inteira no enquadramento, incluindo fachada, paredes externas, cobertura e aberturas visíveis.",
-      "NÃO gerar sala, cozinha, quarto, banheiro ou outro ambiente interno como assunto principal.",
-      "NÃO gerar somente um detalhe isolado da construção.",
-      "Usar perspectiva arquitetônica externa natural, com escala residencial real."
+    blocos.push(
+      "GERAR: edificação completa vista externamente, fachada, paredes, cobertura e aberturas visíveis; escala residencial real; perspectiva arquitetônica natural.",
+      "NÃO GERAR: interior, cômodo isolado, maquete, miniatura, diorama, dollhouse ou brinquedo."
     );
   } else if (tipoAtual === "planta_baixa") {
-    base.push(
-      "TIPO VISUAL OBRIGATÓRIO: planta baixa residencial completa, vista superior ortográfica 2D (top-down).",
-      "Mostrar o imóvel inteiro, perímetro externo, paredes internas, divisórias, portas, janelas e circulação.",
-      "Mostrar todos os ambientes solicitados simultaneamente; não mostrar apenas um cômodo.",
-      "Evitar perspectiva ao nível dos olhos, fotografia de interior e fachada."
+    blocos.push(
+      "GERAR: planta baixa completa, vista superior ortográfica 2D, imóvel inteiro, paredes externas e internas, divisórias, portas, janelas e circulação; mostrar todos os ambientes pedidos.",
+      "NÃO GERAR: fachada, perspectiva ao nível dos olhos ou somente um cômodo."
     );
   } else if (tipoAtual === "fachada") {
-    base.push(
-      "TIPO VISUAL OBRIGATÓRIO: fachada/exterior da edificação, enquadramento amplo mostrando a construção completa.",
-      "Não gerar interior. Preservar materiais, aberturas, pavimentos e características solicitadas."
+    blocos.push(
+      "GERAR: fachada/exterior completo da edificação em enquadramento amplo; preservar materiais, aberturas e pavimentos pedidos; não gerar interior."
     );
   } else if (tipoAtual === "interior") {
-    base.push(
-      "TIPO VISUAL OBRIGATÓRIO: ambiente interno solicitado, com enquadramento amplo e organização compreensível.",
-      "Não trocar o cômodo solicitado por outro ambiente."
+    blocos.push(
+      "GERAR: ambiente interno solicitado, enquadramento amplo, organização coerente e sem trocar o cômodo pedido."
     );
   } else if (tipoAtual === "cobertura") {
-    base.push("TIPO VISUAL OBRIGATÓRIO: cobertura/telhado como assunto principal e geometria claramente visível.");
+    blocos.push("GERAR: cobertura/telhado como assunto principal, geometria claramente visível.");
   } else if (tipoAtual === "area_externa") {
-    base.push("TIPO VISUAL OBRIGATÓRIO: área externa solicitada, mantendo relação coerente com a edificação.");
+    blocos.push("GERAR: área externa solicitada, coerente com a edificação e com os requisitos do usuário.");
   }
 
   if (/\b(de verdade|realista|fotorealista|foto real|pareca real|parecer real|casa real|construcao real)\b/.test(t) || tipoAtual === "edificacao_externa") {
-    base.push(
-      "ESTILO: fotografia arquitetônica realista, construção em escala real, materiais fisicamente plausíveis, iluminação natural e proporções críveis.",
-      "EVITAR: maquete, miniatura, diorama, dollhouse, brinquedo, modelinho, aparência toy-like ou construção em escala reduzida."
+    blocos.push(
+      "ESTILO: fotografia arquitetônica realista, materiais plausíveis, iluminação natural, proporções críveis, construção em escala real."
     );
   }
 
   if (requisitos.length) {
-    base.push("REQUISITOS EXPLÍCITOS DA MENSAGEM ATUAL:", ...requisitos);
+    blocos.push(
+      `REQUISITOS: ${limitarTextoPorCaracteres(requisitos.join(" "), 360)}`
+    );
   }
 
-  base.push("Antes de gerar, confira internamente: o assunto principal da imagem corresponde exatamente ao pedido atual?");
-  return { tipo: tipoAtual, prompt: base.join("\n") };
+  let promptFinal = blocos.join("\n");
+
+  // Proteção definitiva contra HTTP 400 do FLUX por prompt > 2048.
+  // O pedido atual permanece no início e, portanto, nunca é perdido por causa
+  // de um histórico longo.
+  promptFinal = limitarTextoPorCaracteres(
+    promptFinal,
+    MAX_PROMPT_FLUX_CARACTERES
+  );
+
+  return { tipo: tipoAtual, prompt: promptFinal };
 }
 
 async function gerarImagemCloudflare(prompt) {
+  // Segunda barreira de segurança: nenhuma chamada ao FLUX ultrapassa o limite.
+  const promptSeguro = limitarTextoPorCaracteres(prompt, MAX_PROMPT_FLUX_CARACTERES);
   let resultado = null;
 
   for (let tentativa = 1; tentativa <= 2; tentativa++) {
     resultado = await chamarCloudflare(
       CLOUDFLARE_IMAGE_MODEL,
-      { prompt, steps: 4 },
+      { prompt: promptSeguro, steps: 4 },
       90000
     );
 
@@ -1440,7 +1463,7 @@ app.post("/ia/gerar-imagem", async (req, res) => {
       const promptOtimizado = montarPromptImagemInteligente(prompt, historico);
 
       console.log(
-        `[Cloudflare] Gerando imagem com ${CLOUDFLARE_IMAGE_MODEL} | tipo=${promptOtimizado.tipo}`
+        `[Cloudflare] Gerando imagem com ${CLOUDFLARE_IMAGE_MODEL} | tipo=${promptOtimizado.tipo} | promptChars=${promptOtimizado.prompt.length}`
       );
 
       const resultadoCloudflare = await gerarImagemCloudflare(promptOtimizado.prompt);
