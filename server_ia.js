@@ -40,39 +40,40 @@ app.use(cors());
 app.use(express.json({ limit: "28mb" }));
 
 const INSTRUCAO_SISTEMA = `
-Você é a Jisa IA, a inteligência artificial do aplicativo Ache Obra.
+Você é a Jisa IA, a inteligência artificial do aplicativo Ache Obra, especializada em construção civil, reformas, arquitetura, engenharia, manutenção, materiais e planejamento de obras.
 
-O Ache Obra é uma plataforma voltada à construção civil que conecta
-clientes, profissionais, arquitetos e engenheiros.
+OBJETIVO PRINCIPAL
+Entenda primeiro o que o usuário realmente quer e responda ao objetivo dele, não apenas às palavras isoladas. Seja precisa, prática, clara e útil. Responda sempre em português do Brasil, salvo pedido explícito em outro idioma.
 
-Ajude com construção civil, reformas, manutenção, materiais de construção,
-planejamento de obras, descrição de serviços, pedidos de orçamento,
-organização de demandas, arquitetura, engenharia e serviços residenciais
-e comerciais.
+REGRAS DE QUALIDADE
+- Não invente fatos, medidas, preços, normas, leis, especificações, conteúdos de arquivos ou características que não foram fornecidas ou que você não possa sustentar.
+- Preserve exatamente quantidades, dimensões, ambientes, materiais, restrições e preferências informadas pelo usuário.
+- Quando houver várias exigências, confira mentalmente se todas foram atendidas antes de responder.
+- Não troque, omita ou acrescente requisitos importantes sem avisar.
+- Se houver ambiguidade pequena, adote a interpretação mais provável e diga a suposição de forma breve quando ela importar.
+- Faça pergunta somente quando faltar uma informação essencial que impeça uma resposta útil. Não interrogue o usuário desnecessariamente.
+- Quando o usuário pedir uma estimativa, deixe claro o que é estimado e quais fatores podem alterar o resultado.
+- Em cálculos, organize os dados, confira unidades e mostre o resultado de maneira compreensível.
+- Se o usuário corrigir algo, priorize a correção mais recente.
+- Em pedidos de continuação como "ela", "isso", "essa casa", "o projeto", use o contexto fornecido na mensagem/histórico e não reinvente o objeto.
 
-Responda sempre em português do Brasil, salvo pedido explícito em outro idioma.
-Seja clara, objetiva, educada e útil.
+CONSTRUÇÃO E ARQUITETURA
+- Diferencie ideia conceitual, estudo preliminar, orçamento estimado e projeto técnico/executivo.
+- Para distribuição de ambientes, respeite o número de cômodos e as dimensões fornecidas.
+- Para plantas, layouts e fachadas, descreva circulação, acessos e relações entre ambientes quando isso ajudar.
+- Não apresente imagem gerada por IA como planta executiva, projeto estrutural ou documento técnico pronto para execução.
+- Questões estruturais, elétricas, gás, incêndio, fundações e outras situações de segurança devem receber cautela proporcional ao risco e, quando necessário, recomendação de avaliação presencial por profissional habilitado.
 
-Você pode analisar imagens e arquivos enviados pelo usuário. Ao responder sobre
-um arquivo, baseie-se no conteúdo realmente disponível nele e não invente
-informações ausentes.
+IMAGENS E ARQUIVOS
+Você pode analisar imagens e arquivos enviados. Baseie-se somente no conteúdo realmente disponível e diferencie claramente o que é visível do que é hipótese.
+Ao analisar fotografias de obras, não afirme com certeza a causa de trincas, infiltrações, falhas estruturais, elétricas, hidráulicas ou defeitos ocultos sem evidência suficiente.
 
-Ao analisar fotografias de obras:
-- descreva somente o que a imagem sustenta;
-- não afirme com certeza a causa de trincas, infiltrações, falhas estruturais,
-  elétricas, hidráulicas ou defeitos ocultos sem inspeção adequada;
-- quando houver possível risco estrutural, elétrico, gás, incêndio ou segurança,
-  recomende avaliação presencial por profissional habilitado;
-- não invente medidas, materiais, marcas ou condições invisíveis.
-
-Quando valores, quantidades ou custos dependerem da região, materiais,
-mão de obra ou condições da obra, deixe claro que são estimativas.
-
-Não invente preços, normas técnicas, leis ou informações que não tenha
-segurança para fornecer.
-
-Quando uma questão exigir avaliação presencial de engenheiro, arquiteto,
-eletricista ou outro profissional habilitado, deixe isso claro.
+FORMA DA RESPOSTA
+- Comece pela resposta que resolve o pedido.
+- Evite introduções longas, repetições e texto genérico.
+- Use tópicos quando melhorarem a leitura, mas não transforme toda resposta em lista.
+- Para pedidos complexos, organize requisitos antes de concluir.
+- Se não souber ou não houver dados suficientes, diga exatamente o que falta em vez de inventar.
 `;
 
 const MIME_PERMITIDOS = new Set([
@@ -276,8 +277,8 @@ function criarBodyGemini(mensagem, arquivos = []) {
       },
     ],
     generationConfig: {
-      temperature: 0.7,
-      maxOutputTokens: 2000,
+      temperature: 0.35,
+      maxOutputTokens: 2600,
     },
   };
 }
@@ -683,8 +684,8 @@ async function conversarCloudflare(mensagem) {
         content: texto,
       },
     ],
-    max_tokens: 2000,
-    temperature: 0.7,
+    max_tokens: 2600,
+    temperature: 0.35,
   });
 
   if (!resultado.sucesso) {
@@ -714,6 +715,113 @@ async function conversarCloudflare(mensagem) {
     resposta,
     modelo: CLOUDFLARE_TEXT_MODEL,
   };
+}
+
+function normalizarTextoBusca(valor) {
+  return String(valor || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function detectarTipoImagem(prompt) {
+  const t = normalizarTextoBusca(prompt);
+
+  if (/planta baixa|floor plan|repartic|divis(ao|oes)|distribuicao.*(comodo|ambiente)|layout.*casa/.test(t)) {
+    return "planta_baixa";
+  }
+  if (/fachada|frente da casa|exterior da casa|elevacao frontal/.test(t)) {
+    return "fachada";
+  }
+  if (/cozinha|quarto|banheiro|sala|lavanderia|escritorio|interior|ambiente interno/.test(t)) {
+    return "interior";
+  }
+  if (/telhado|cobertura/.test(t)) return "cobertura";
+  if (/jardim|paisag|area externa|quintal/.test(t)) return "area_externa";
+  return "geral";
+}
+
+function extrairRequisitosVisuais(prompt) {
+  const texto = String(prompt || "").trim();
+  const t = normalizarTextoBusca(texto);
+  const requisitos = [];
+
+  const dimensoes = t.match(/\b\d+(?:[.,]\d+)?\s*(?:m|metro|metros)?\s*[xX×]\s*\d+(?:[.,]\d+)?\s*(?:m|metro|metros)?\b/i);
+  if (dimensoes) requisitos.push(`Dimensões mencionadas pelo usuário: ${dimensoes[0]}.`);
+
+  const termos = [
+    "quarto", "suite", "banheiro", "lavabo", "sala", "cozinha", "lavanderia",
+    "garagem", "escritorio", "closet", "despensa", "varanda", "corredor",
+    "area gourmet", "churrasqueira", "jardim", "piscina"
+  ];
+
+  for (const termo of termos) {
+    if (t.includes(termo)) requisitos.push(`Preservar o requisito citado: ${termo}.`);
+  }
+
+  return requisitos;
+}
+
+function enriquecerPromptImagem(prompt) {
+  const original = String(prompt || "").trim();
+  const tipo = detectarTipoImagem(original);
+  const requisitos = extrairRequisitosVisuais(original);
+
+  const base = [
+    "Crie uma única imagem que cumpra fielmente o pedido do usuário.",
+    "PRIORIDADE MÁXIMA: respeitar todos os elementos, quantidades, relações espaciais, dimensões e restrições explicitamente solicitados.",
+    "Não substitua o assunto principal por um detalhe isolado. Não omita elementos essenciais do pedido.",
+    "Mantenha composição clara, coerente e imediatamente compreensível.",
+  ];
+
+  if (tipo === "planta_baixa") {
+    base.push(
+      "TIPO VISUAL OBRIGATÓRIO: planta baixa residencial completa, vista superior ortográfica 2D (top-down), como estudo preliminar arquitetônico.",
+      "MOSTRAR O IMÓVEL INTEIRO dentro do enquadramento, com perímetro externo, paredes internas, divisórias, portas, janelas e circulação legíveis.",
+      "Mostrar TODOS os ambientes solicitados simultaneamente e claramente separados. A imagem não pode mostrar somente um cômodo.",
+      "Evitar perspectiva de câmera ao nível dos olhos, fotografia de interior, close de ambiente, fachada externa e cortes que escondam parte da residência.",
+      "Priorizar a organização espacial e a leitura das repartições acima de decoração, mobiliário ou efeitos artísticos.",
+      "Se houver móveis, usar apenas mobiliário simples em vista superior para ajudar a identificar os ambientes, sem esconder paredes e circulação.",
+      "Não inventar cômodos adicionais quando o usuário especificar uma lista de ambientes.",
+      "Não tratar esta imagem como projeto executivo: ela é uma representação visual conceitual da distribuição solicitada."
+    );
+  } else if (tipo === "fachada") {
+    base.push(
+      "TIPO VISUAL: fachada/exterior da edificação, enquadramento amplo mostrando a construção completa.",
+      "Preservar número de pavimentos, aberturas, garagem, materiais, cores e estilo citados pelo usuário.",
+      "Evitar transformar o pedido em cena interna ou mostrar apenas detalhes da fachada."
+    );
+  } else if (tipo === "interior") {
+    base.push(
+      "TIPO VISUAL: ambiente interno coerente com o cômodo solicitado.",
+      "Preservar dimensões, mobiliário, materiais, cores, aberturas e estilo mencionados.",
+      "Usar enquadramento suficientemente amplo para tornar a organização do ambiente compreensível."
+    );
+  } else if (tipo === "cobertura") {
+    base.push(
+      "TIPO VISUAL: cobertura/telhado como assunto principal, com geometria geral claramente visível.",
+      "Evitar substituir a cobertura por uma cena interna ou por detalhe decorativo."
+    );
+  } else if (tipo === "area_externa") {
+    base.push(
+      "TIPO VISUAL: área externa completa e coerente com os elementos solicitados.",
+      "Manter visíveis as relações entre edificação, circulação e elementos externos pedidos."
+    );
+  }
+
+  if (requisitos.length) {
+    base.push("REQUISITOS DETECTADOS QUE NÃO DEVEM SER IGNORADOS:", ...requisitos);
+  }
+
+  base.push(
+    "PEDIDO ORIGINAL DO USUÁRIO (fonte principal; não alterar seu significado):",
+    original,
+    "Antes de gerar, confira internamente se a composição representa o pedido completo."
+  );
+
+  return { tipo, prompt: base.join("\n") };
 }
 
 async function gerarImagemCloudflare(prompt) {
@@ -1165,9 +1273,13 @@ app.post("/ia/gerar-imagem", async (req, res) => {
 
     // Sem referência: usa Cloudflare FLUX, já validado no ambiente.
     if (referencias.length === 0 && cloudflareConfigurado()) {
-      console.log(`[Cloudflare] Gerando imagem com ${CLOUDFLARE_IMAGE_MODEL}`);
+      const promptOtimizado = enriquecerPromptImagem(prompt);
 
-      const resultadoCloudflare = await gerarImagemCloudflare(prompt);
+      console.log(
+        `[Cloudflare] Gerando imagem com ${CLOUDFLARE_IMAGE_MODEL} | tipo=${promptOtimizado.tipo}`
+      );
+
+      const resultadoCloudflare = await gerarImagemCloudflare(promptOtimizado.prompt);
 
       if (resultadoCloudflare.sucesso) {
         return res.status(200).json({
