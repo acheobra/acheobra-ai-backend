@@ -53,7 +53,7 @@ ESCOPO OBRIGATÓRIO
 - Também inclui o lado comercial da construção: vendas, compras, fornecedores, lojas de materiais, atendimento, clientes, propostas, orçamentos, divulgação, marketing, negociação e gestão quando o contexto estiver relacionado à construção civil.
 - Criação, análise e edição de imagens só podem ser feitas quando estiverem relacionadas à construção civil, arquitetura, engenharia, obras, reformas, ambientes, materiais, produtos ou negócios da construção.
 - Elementos secundários podem aparecer em um pedido de construção. Exemplo: uma casa com carro, pessoas, árvores ou cachorro continua dentro do escopo porque o assunto principal é a construção.
-- Use o histórico para entender continuações. Pedidos como "mude a cor", "adicione uma garagem", "faça mais realista" ou "agora mostre por dentro" podem continuar um projeto de construção anterior.
+- Use o histórico e o significado da conversa para entender continuações, sem depender de palavras-chave específicas. Pedidos como "pinte as paredes de amarelo", "mude a cor", "deixe mais claro", "troque o piso", "adicione uma garagem", "faça mais realista" ou "agora mostre por dentro" podem continuar um projeto de construção anterior.
 - Se o assunto principal NÃO estiver relacionado à construção civil, não responda ao conteúdo, não execute a tarefa e não gere imagem. Responda amigavelmente e de forma curta que a Jisa é especialista somente em construção civil.
 - Saudações, agradecimentos, despedidas e pequenas interações sociais são SEMPRE permitidos, mesmo sem relação com construção civil.
 - Nunca trate uma saudação, agradecimento ou despedida como assunto fora do escopo.
@@ -78,7 +78,7 @@ COMPORTAMENTO
 
 CONTEXTO
 - Use o histórico apenas para entender referências e continuar o assunto.
-- A mensagem atual tem prioridade sobre o histórico.
+- A mensagem atual tem prioridade sobre o histórico. Interprete frases curtas pelo contexto sem exigir que o usuário repita "casa", "obra", "sala" ou outros termos de construção.
 - Quando o usuário corrigir algo, aplique a correção e continue sem pedir novamente dados já informados.
 
 CONFIABILIDADE
@@ -94,33 +94,59 @@ ESTILO
 - Não ofereça ajuda adicional automaticamente ao final de toda resposta.
 `;
 
-function pedidoRelacionadoConstrucao(mensagem, historico = []) {
+function interacaoSocialSimples(mensagem) {
   const atual = normalizarTextoBusca(mensagem);
+  return /^(oi|ola|opa|e ai|bom dia|boa tarde|boa noite|tudo bem|como vai|como voce esta|como esta|obrigado|obrigada|muito obrigado|muito obrigada|valeu|agradeco|por favor|ate mais|ate logo|tchau|falou|bom trabalho|tenha um bom dia|tenha uma boa tarde|tenha uma boa noite)( jisa)?[!?. ]*$/.test(atual);
+}
 
-  // Saudações, agradecimentos, despedidas e pequenas interações sociais
-  // são sempre permitidas para a Jisa conversar de forma simpática e natural.
-  const interacaoSocial = /^(oi|ola|opa|e ai|bom dia|boa tarde|boa noite|tudo bem|como vai|como voce esta|como esta|obrigado|obrigada|muito obrigado|muito obrigada|valeu|agradeco|por favor|ate mais|ate logo|tchau|falou|bom trabalho|tenha um bom dia|tenha uma boa tarde|tenha uma boa noite)( jisa)?[!?. ]*$/;
-
-  if (interacaoSocial.test(atual)) {
-    return true;
+async function classificarEscopoConstrucao(mensagem, historico = []) {
+  // O filtro antigo por palavras-chave foi removido. A própria IA interpreta
+  // significado + contexto, evitando exigir uma lista infinita de verbos.
+  if (interacaoSocialSimples(mensagem)) {
+    return { relacionado: true, motivo: "interacao-social" };
   }
 
-  const termosConstrucao = /\b(obra|obras|construcao|construir|reforma|reformar|arquitetura|arquitetonico|arquiteto|engenharia|engenheiro|projeto|planta baixa|planta|fachada|casa|residencia|residencial|predio|edificio|sobrado|apartamento|imovel|terreno|lote|fundacao|alicerce|sapata|estaca|estrutura|estrutural|viga|pilar|laje|telhado|cobertura|telha|parede|muro|alvenaria|tijolo|bloco|concreto|cimento|argamassa|reboco|chapisco|piso|porcelanato|ceramica|revestimento|gesso|drywall|forro|pintura|tinta|impermeabilizacao|hidraulica|encanamento|tubulacao|eletrica|eletricista|fiacao|disjuntor|quadro eletrico|iluminacao|porta|janela|esquadria|vidro|madeira|metal|aco|ferragem|vergalhao|banheiro|cozinha|quarto|sala|lavanderia|garagem|varanda|area gourmet|churrasqueira|piscina|jardim|paisagismo|interior|decoracao|acabamento|material de construcao|materiais de construcao|ferramenta|equipamento|pedreiro|mestre de obras|empreiteiro|construtora|canteiro|orcamento|quantitativo|metragem|metro quadrado|cronograma|mao de obra|fornecedor|loja de material|cliente de obra|venda de material|comprar material|compras de material|norma tecnica|abnt|habite-se|alvara de obra|demolicao|escavacao|drenagem|saneamento|energia solar|fotovoltaico|ar condicionado|climatizacao|marcenaria|serralheria)\b/;
+  // Se Cloudflare não estiver disponível, não bloqueamos preventivamente.
+  // Para texto, a INSTRUCAO_SISTEMA continua impondo o escopo à IA.
+  if (!cloudflareConfigurado()) {
+    return { relacionado: true, motivo: "sem-classificador" };
+  }
 
-  if (termosConstrucao.test(atual)) return true;
+  const contexto = historico
+    .filter((item) => item?.content)
+    .slice(-8)
+    .map((item) => `${item.role === "assistant" ? "Jisa" : "Usuário"}: ${String(item.content).slice(0, 700)}`)
+    .join("\n");
 
-  // Só usa o histórico para mensagens que claramente parecem continuação do trabalho anterior.
-  const pareceContinuacao = /\b(ela|ele|essa|esse|esta|este|isso|anterior|antes|mesma|mesmo|assim|agora|mude|troque|altere|adicione|coloque|retire|remova|refaca|refazer|mais realista|de verdade|por dentro|por fora|outra opcao|outra versão|outra versao)\b/.test(atual);
+  const instrucao = `Você é um classificador de intenção da Jisa IA, especialista em construção civil.
+Decida se a MENSAGEM ATUAL pertence à construção civil OU é continuação de um assunto de construção presente no CONTEXTO.
+Entenda o significado, não procure apenas palavras-chave.
+Considere construção em sentido amplo: obras, reformas, arquitetura, engenharia, ambientes, decoração ligada ao imóvel, pintura, cores, móveis no projeto de ambiente, materiais, ferramentas, instalações, orçamento, compras, vendas, clientes, fornecedores, profissionais e negócios da construção.
+Uma frase curta como "pinte de amarelo", "deixe mais claro", "aumente a janela" ou "troque o piso" é relacionada quando o contexto mostra uma casa, cômodo, projeto, obra ou imagem de construção.
+Não aprove assuntos realmente alheios só porque existe um contexto anterior de construção. Exemplo: depois de falar de uma casa, "quem ganhou o jogo ontem?" continua FORA.
+Saudações e cordialidade são permitidas.
+Responda SOMENTE com DENTRO ou FORA.`;
 
-  if (!pareceContinuacao) return false;
+  const resultado = await chamarCloudflare(CLOUDFLARE_TEXT_MODEL, {
+    messages: [
+      { role: "system", content: instrucao },
+      {
+        role: "user",
+        content: `${contexto ? `CONTEXTO:\n${contexto}\n\n` : ""}MENSAGEM ATUAL:\n${String(mensagem || "").slice(0, 2000)}`,
+      },
+    ],
+    max_tokens: 8,
+    temperature: 0,
+  }, 15000);
 
-  const contextoUsuario = historico
-    .filter((item) => item?.role === "user" && item?.content)
-    .slice(-4)
-    .map((item) => normalizarTextoBusca(item.content))
-    .join(" ");
+  if (!resultado.sucesso) {
+    console.warn("[Jisa IA] Classificador de escopo indisponível; permitindo processamento normal.");
+    return { relacionado: true, motivo: "classificador-indisponivel" };
+  }
 
-  return termosConstrucao.test(contextoUsuario);
+  const resposta = normalizarTextoBusca(extrairTextoCloudflare(resultado.dados));
+  const relacionado = resposta.startsWith("dentro");
+  return { relacionado, motivo: "classificador-semantico" };
 }
 
 const MIME_PERMITIDOS = new Set([
@@ -1325,18 +1351,9 @@ app.post("/ia/perguntar", async (req, res) => {
       });
     }
 
-    // Bloqueio de domínio para texto puro. Arquivos são analisados pelo Gemini,
-    // que recebe a mesma regra obrigatória de escopo na instrução de sistema.
-    if (arquivos.length === 0 && !pedidoRelacionadoConstrucao(mensagem, historico)) {
-      return res.status(200).json({
-        ok: true,
-        resposta: RESPOSTA_FORA_ESCOPO,
-        provedor: "jisa",
-        modelo: "filtro-de-escopo",
-        fallback: false,
-        foraDoEscopo: true,
-      });
-    }
+    // Não usamos mais filtro rígido por palavras-chave no texto.
+    // Cloudflare/Gemini recebem a regra de especialização na INSTRUCAO_SISTEMA
+    // e interpretam semanticamente a mensagem junto com o histórico.
 
     console.log(
       `[Jisa IA] texto=${mensagem ? "SIM" : "NÃO"} arquivos=${arquivos.length}`
@@ -1489,16 +1506,17 @@ app.post("/ia/gerar-imagem", async (req, res) => {
       });
     }
 
-    // Imagens também são restritas ao domínio da construção civil.
-    // O histórico só libera pedidos curtos quando forem continuação clara de um
-    // projeto de construção já em andamento.
-    if (!pedidoRelacionadoConstrucao(prompt, historico)) {
+    // Para imagens, o FLUX não entende a instrução de sistema da Jisa.
+    // Por isso usamos uma classificação SEMÂNTICA antes de gerar, considerando
+    // a mensagem atual e o contexto, sem depender de listas de palavras.
+    const escopoImagem = await classificarEscopoConstrucao(prompt, historico);
+    if (!escopoImagem.relacionado) {
       return res.status(200).json({
         ok: true,
         tipo: "texto",
         resposta: RESPOSTA_FORA_ESCOPO,
         provedor: "jisa",
-        modelo: "filtro-de-escopo",
+        modelo: "filtro-semantico-de-escopo",
         fallback: false,
         foraDoEscopo: true,
       });
