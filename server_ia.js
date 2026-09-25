@@ -51,7 +51,9 @@ REGRAS DE QUALIDADE
 - Quando houver várias exigências, confira mentalmente se todas foram atendidas antes de responder.
 - Não troque, omita ou acrescente requisitos importantes sem avisar.
 - Se houver ambiguidade pequena, adote a interpretação mais provável e diga a suposição de forma breve quando ela importar.
-- Faça pergunta somente quando faltar uma informação essencial que impeça uma resposta útil. Não interrogue o usuário desnecessariamente.
+- REGRA EXECUTAR PRIMEIRO: quando houver informação suficiente para produzir uma resposta, proposta, estimativa ou imagem útil, execute usando suposições razoáveis para detalhes secundários.
+- Faça pergunta somente quando faltar uma informação realmente essencial que impeça a execução. Nunca reinicie um levantamento de requisitos se o histórico já contiver as respostas.
+- Correções curtas como "mais realista", "de verdade", "igual à anterior", "mude só o telhado", "agora faça a imagem" e "conforme pedi" são continuação do trabalho anterior; preserve tudo que não foi explicitamente alterado.
 - Quando o usuário pedir uma estimativa, deixe claro o que é estimado e quais fatores podem alterar o resultado.
 - Em cálculos, organize os dados, confira unidades e mostre o resultado de maneira compreensível.
 - Se o usuário corrigir algo, priorize a correção mais recente.
@@ -244,7 +246,94 @@ function normalizarArquivos(body) {
   return raws.map((raw, i) => normalizarUmArquivo(raw, i));
 }
 
-function criarBodyGemini(mensagem, arquivos = []) {
+const MAX_HISTORICO_MENSAGENS = 14;
+const MAX_HISTORICO_CARACTERES = 12000;
+
+function normalizarHistorico(raw) {
+  if (!Array.isArray(raw)) return [];
+
+  const saida = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+
+    const papelBruto = String(item.role ?? item.papel ?? item.tipo ?? "").toLowerCase();
+    const role = ["assistant", "assistente", "jisa", "ia"].includes(papelBruto)
+      ? "assistant"
+      : ["user", "usuario", "usuário", "cliente"].includes(papelBruto)
+        ? "user"
+        : null;
+
+    const content = String(
+      item.content ?? item.texto ?? item.mensagem ?? item.text ?? ""
+    ).trim();
+
+    if (!role || !content) continue;
+    saida.push({ role, content: content.slice(0, 4000) });
+  }
+
+  const recentes = saida.slice(-MAX_HISTORICO_MENSAGENS);
+  let total = 0;
+  const selecionadas = [];
+
+  for (let i = recentes.length - 1; i >= 0; i--) {
+    const item = recentes[i];
+    if (total + item.content.length > MAX_HISTORICO_CARACTERES && selecionadas.length) break;
+    selecionadas.push(item);
+    total += item.content.length;
+  }
+
+  return selecionadas.reverse();
+}
+
+function historicoComoTexto(historico = []) {
+  if (!historico.length) return "";
+  return historico
+    .map((item) => `${item.role === "assistant" ? "Jisa" : "Usuário"}: ${item.content}`)
+    .join("\n");
+}
+
+function montarMensagemComContexto(mensagem, historico = []) {
+  const atual = String(mensagem || "").trim();
+  if (!historico.length) return atual;
+
+  return [
+    "CONTEXTO RECENTE DA CONVERSA (use para resolver referências e preservar requisitos já informados):",
+    historicoComoTexto(historico),
+    "",
+    "MENSAGEM ATUAL DO USUÁRIO:",
+    atual,
+    "",
+    "INSTRUÇÃO: trate a mensagem atual como continuação quando fizer sentido. Não peça novamente informações já presentes no contexto. Preserve tudo que o usuário não pediu para mudar."
+  ].join("\n");
+}
+
+function detectarCorrecaoVisual(prompt) {
+  const t = normalizarTextoBusca(prompt);
+  return /\b(de verdade|realista|mais realista|fotorealista|foto real|pareca real|parecer real|igual a anterior|igual ao anterior|como antes|conforme pedi|como pedi|refaca|refazer|mude|troque|altere|adicione|retire|remova|agora)\b/.test(t);
+}
+
+function montarPromptImagemComContexto(prompt, historico = []) {
+  const atual = String(prompt || "").trim();
+  if (!historico.length) return atual;
+
+  const contexto = historicoComoTexto(historico);
+  const correcao = detectarCorrecaoVisual(atual);
+
+  return [
+    "CONTEXTO DO PEDIDO VISUAL:",
+    contexto,
+    "",
+    "PEDIDO VISUAL ATUAL:",
+    atual,
+    "",
+    correcao
+      ? "Este pedido é uma correção/continuação. Preserve os requisitos anteriores e altere somente o que a mensagem atual pede."
+      : "Use o contexto anterior somente quando ele for relevante ao pedido visual atual.",
+    "Não faça perguntas: produza a melhor representação possível com os dados disponíveis."
+  ].join("\n");
+}
+
+function criarBodyGemini(mensagem, arquivos = [], historico = []) {
   const parts = [];
 
   for (const arquivo of arquivos) {
@@ -256,11 +345,13 @@ function criarBodyGemini(mensagem, arquivos = []) {
     });
   }
 
-  const texto =
+  const mensagemBase =
     mensagem ||
     (arquivos.length
       ? "Analise o conteúdo enviado e explique os pontos mais importantes."
       : "");
+
+  const texto = montarMensagemComContexto(mensagemBase, historico);
 
   if (texto) {
     parts.push({ text: texto });
@@ -283,7 +374,7 @@ function criarBodyGemini(mensagem, arquivos = []) {
   };
 }
 
-async function chamarGemini(modelo, mensagem, arquivos = []) {
+async function chamarGemini(modelo, mensagem, arquivos = [], historico = []) {
   const endpoint =
     `https://generativelanguage.googleapis.com/v1beta/models/` +
     `${encodeURIComponent(modelo)}:generateContent`;
@@ -298,7 +389,7 @@ async function chamarGemini(modelo, mensagem, arquivos = []) {
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY,
       },
-      body: JSON.stringify(criarBodyGemini(mensagem, arquivos)),
+      body: JSON.stringify(criarBodyGemini(mensagem, arquivos, historico)),
       signal: controller.signal,
     });
 
@@ -322,14 +413,14 @@ async function chamarGemini(modelo, mensagem, arquivos = []) {
   }
 }
 
-async function chamarGeminiComRetry(modelo, mensagem, arquivos = []) {
+async function chamarGeminiComRetry(modelo, mensagem, arquivos = [], historico = []) {
   for (let tentativa = 1; tentativa <= MAX_TENTATIVAS; tentativa++) {
     try {
       console.log(
         `[Gemini] ${modelo} - tentativa ${tentativa}/${MAX_TENTATIVAS}`
       );
 
-      const resultado = await chamarGemini(modelo, mensagem, arquivos);
+      const resultado = await chamarGemini(modelo, mensagem, arquivos, historico);
 
       if (resultado.ok) {
         const resposta = extrairTextoGemini(resultado.dados);
@@ -668,7 +759,7 @@ function extrairTextoCloudflare(dados) {
   return null;
 }
 
-async function conversarCloudflare(mensagem) {
+async function conversarCloudflare(mensagem, historico = []) {
   const texto =
     mensagem ||
     "Olá. Apresente-se brevemente como Jisa IA, assistente do Ache Obra.";
@@ -679,6 +770,10 @@ async function conversarCloudflare(mensagem) {
         role: "system",
         content: INSTRUCAO_SISTEMA,
       },
+      ...historico.map((item) => ({
+        role: item.role,
+        content: item.content,
+      })),
       {
         role: "user",
         content: texto,
@@ -775,6 +870,13 @@ function enriquecerPromptImagem(prompt) {
     "Não substitua o assunto principal por um detalhe isolado. Não omita elementos essenciais do pedido.",
     "Mantenha composição clara, coerente e imediatamente compreensível.",
   ];
+
+  if (/\b(de verdade|realista|fotorealista|foto real|pareca real|parecer real|construcao real|casa real)\b/.test(normalizarTextoBusca(original))) {
+    base.push(
+      "ESTILO OBRIGATÓRIO: aparência fotográfica arquitetônica realista, construção em escala real, materiais fisicamente plausíveis, iluminação natural e proporções residenciais críveis.",
+      "NÃO gerar maquete, miniatura, diorama, brinquedo, dollhouse, modelinho 3D ou aparência de objeto em escala reduzida."
+    );
+  }
 
   if (tipo === "planta_baixa") {
     base.push(
@@ -1075,6 +1177,8 @@ app.post("/ia/perguntar", async (req, res) => {
         ? req.body.mensagem.trim()
         : "";
 
+    const historico = normalizarHistorico(req.body?.historico);
+
     if (mensagem.length > 8000) {
       return res.status(400).json({
         ok: false,
@@ -1108,7 +1212,7 @@ app.post("/ia/perguntar", async (req, res) => {
     if (arquivos.length === 0 && cloudflareConfigurado()) {
       console.log(`[Cloudflare] Conversa usando ${CLOUDFLARE_TEXT_MODEL}`);
 
-      const resultadoCloudflare = await conversarCloudflare(mensagem);
+      const resultadoCloudflare = await conversarCloudflare(mensagem, historico);
 
       if (resultadoCloudflare.sucesso) {
         return res.status(200).json({
@@ -1141,7 +1245,8 @@ app.post("/ia/perguntar", async (req, res) => {
     const resultadoPrincipal = await chamarGeminiComRetry(
       GEMINI_MODEL,
       mensagem,
-      arquivos
+      arquivos,
+      historico
     );
 
     if (resultadoPrincipal.sucesso) {
@@ -1179,7 +1284,8 @@ app.post("/ia/perguntar", async (req, res) => {
     const resultadoFallback = await chamarGeminiComRetry(
       GEMINI_FALLBACK_MODEL,
       mensagem,
-      arquivos
+      arquivos,
+      historico
     );
 
     if (resultadoFallback.sucesso) {
@@ -1233,6 +1339,8 @@ app.post("/ia/gerar-imagem", async (req, res) => {
           ? req.body.mensagem.trim()
           : "";
 
+    const historico = normalizarHistorico(req.body?.historico);
+
     if (!prompt) {
       return res.status(400).json({
         ok: false,
@@ -1273,7 +1381,8 @@ app.post("/ia/gerar-imagem", async (req, res) => {
 
     // Sem referência: usa Cloudflare FLUX, já validado no ambiente.
     if (referencias.length === 0 && cloudflareConfigurado()) {
-      const promptOtimizado = enriquecerPromptImagem(prompt);
+      const promptContextual = montarPromptImagemComContexto(prompt, historico);
+      const promptOtimizado = enriquecerPromptImagem(promptContextual);
 
       console.log(
         `[Cloudflare] Gerando imagem com ${CLOUDFLARE_IMAGE_MODEL} | tipo=${promptOtimizado.tipo}`
@@ -1329,8 +1438,9 @@ app.post("/ia/gerar-imagem", async (req, res) => {
         });
       }
 
+      const promptContextual = montarPromptImagemComContexto(prompt, historico);
       const resultado = await gerarImagemGemini({
-        prompt,
+        prompt: promptContextual,
         referencias,
         aspectRatio:
           typeof req.body?.aspectRatio === "string"
