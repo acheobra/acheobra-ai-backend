@@ -12,8 +12,6 @@
  * Variáveis de ambiente esperadas no Render:
  *   GEMINI_API_KEY
  *   GEMINI_FALLBACK_MODEL
- *   CLOUDFLARE_ACCOUNT_ID
- *   CLOUDFLARE_API_TOKEN
  *
  * O servidor mantém compatibilidade com:
  *   POST /ia/perguntar
@@ -56,23 +54,9 @@ const GEMINI_IMAGE_MODEL = String(
   process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image'
 ).trim();
 
-const CLOUDFLARE_ACCOUNT_ID = String(
-  process.env.CLOUDFLARE_ACCOUNT_ID || ''
-).trim();
-
-const CLOUDFLARE_API_TOKEN = String(
-  process.env.CLOUDFLARE_API_TOKEN || ''
-).trim();
-
-const CLOUDFLARE_IMAGE_MODEL = String(
-  process.env.CLOUDFLARE_IMAGE_MODEL ||
-    '@cf/black-forest-labs/flux-1-schnell'
-).trim();
-
 const MAX_HISTORICO = 14;
 const MAX_ARQUIVOS = 5;
 const MAX_ARQUIVO_BYTES = 18 * 1024 * 1024;
-const MAX_PROMPT_FLUX_CARACTERES = 1900;
 const TIMEOUT_GEMINI_MS = 65000;
 const TIMEOUT_IMAGEM_MS = 100000;
 
@@ -610,7 +594,7 @@ Saudações, agradecimentos, despedidas e conversa social curta são permitidos.
 Classifique o pedido atual em UMA ação:
 - "texto": pergunta, conversa, análise, cálculo, orientação ou análise de anexos.
 - "imagem": criar/gerar uma NOVA imagem visual relacionada à construção civil.
-- "editar_imagem": modificar uma imagem de referência enviada pelo usuário.
+- "editar_imagem": modificar a imagem enviada agora OU continuar/modificar a última imagem gerada pela Jisa quando ela estiver disponível como memória visual.
 - "fora_escopo": pedido claramente fora de construção civil, exceto interação social.
 
 REGRAS IMPORTANTES:
@@ -618,10 +602,10 @@ REGRAS IMPORTANTES:
 - "crie um dragão" é "fora_escopo".
 - Se o usuário enviou uma imagem apenas para analisar, a ação é "texto".
 - Se enviou uma imagem e pediu para alterar visualmente, é "editar_imagem".
+- Se existe última imagem gerada disponível e o pedido continua aquela imagem (ex.: "coloque uma garagem", "troque o telhado", "mais realista", "agora por dentro"), use "editar_imagem".
+- Só use "imagem" com uma imagem anterior disponível quando o usuário estiver pedindo claramente uma criação nova e independente.
 - Use o histórico para compreender "ela", "essa casa", "a anterior",
   "mais realista", "agora coloque garagem", "mostre por dentro" etc.
-- Se o usuário está continuando uma imagem gerada anteriormente e pede uma nova
-  visualização/versão, use "imagem".
 - Não invente intenção visual se o usuário só pediu explicação textual.
 - Para "imagem", crie também um promptVisual compacto, completo e autocontido.
 - Para "editar_imagem", crie um promptVisual objetivo dizendo o que preservar
@@ -643,6 +627,7 @@ async function decidirAcaoJisa({
   historico = [],
   arquivos = [],
   forcarImagem = false,
+  temImagemAnteriorDisponivel = false,
 }) {
   const imagens = arquivos.filter((arquivo) => arquivo.ehImagem);
   const documentos = arquivos.filter((arquivo) => !arquivo.ehImagem);
@@ -662,6 +647,9 @@ ANEXOS:
 - documentos enviados agora: ${documentos.length}
 - existe indicação de imagem gerada anteriormente no histórico: ${
     temImagemAnterior ? 'sim' : 'não'
+  }
+- a última imagem gerada está disponível em bytes para edição: ${
+    temImagemAnteriorDisponivel ? 'sim' : 'não'
   }
 
 COMPATIBILIDADE:
@@ -700,12 +688,6 @@ Mesmo quando o endpoint visual foi solicitado, respeite o escopo da construção
     throw new Error(`Ação inválida retornada pelo Gemini: ${acao || '(vazia)'}`);
   }
 
-  if (acao === 'editar_imagem' && imagens.length === 0) {
-    // Sem imagem de referência recebida nesta requisição não há como editar bytes.
-    // Se houver continuidade visual, geramos uma nova versão a partir do contexto.
-    acao = 'imagem';
-  }
-
   if (acao === 'imagem' && documentos.length > 0 && imagens.length === 0) {
     // O orquestrador pode interpretar um documento como base para imagem, mas o
     // endpoint visual do FLUX não lê documentos. Mantemos o cérebro no Gemini:
@@ -721,144 +703,9 @@ Mesmo quando o endpoint visual foi solicitado, respeite o escopo da construção
 }
 
 // ----------------------------------------------------------------
-// CLOUDFLARE FLUX - GERAÇÃO DE IMAGEM NOVA
+// GEMINI IMAGE - GERAÇÃO E EDIÇÃO DE IMAGENS
 // ----------------------------------------------------------------
 
-function urlCloudflareImagem() {
-  return (
-    'https://api.cloudflare.com/client/v4/accounts/' +
-    encodeURIComponent(CLOUDFLARE_ACCOUNT_ID) +
-    '/ai/run/' +
-    CLOUDFLARE_IMAGE_MODEL
-  );
-}
-
-function compactarPromptFlux(promptVisual) {
-  const base = textoSeguro(promptVisual, 1700);
-
-  const complemento =
-    ' Imagem de construção civil coerente, proporções plausíveis, ' +
-    'materiais e detalhes arquitetônicos consistentes. ' +
-    'Quando o pedido exigir realismo: fotografia arquitetônica fotorrealista, ' +
-    'escala real, materiais reais e iluminação natural; sem aparência de maquete.';
-
-  return limitarTextoPorCaracteres(
-    `${base}${complemento}`,
-    MAX_PROMPT_FLUX_CARACTERES
-  );
-}
-
-function extrairImagemCloudflare(dados) {
-  if (!dados) return null;
-
-  if (typeof dados === 'string') {
-    const limpo = dados.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
-    return limpo || null;
-  }
-
-  const possiveis = [
-    dados?.result?.image,
-    dados?.result?.base64,
-    dados?.result?.data,
-    dados?.image,
-    dados?.base64,
-    dados?.data,
-  ];
-
-  for (const valor of possiveis) {
-    if (typeof valor === 'string' && valor.trim()) {
-      return valor
-        .trim()
-        .replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
-    }
-  }
-
-  return null;
-}
-
-async function gerarImagemCloudflare(promptVisual) {
-  if (!CLOUDFLARE_ACCOUNT_ID || !CLOUDFLARE_API_TOKEN) {
-    const erro = new Error(
-      'As credenciais do Cloudflare não estão configuradas no Render.'
-    );
-    erro.statusCode = 503;
-    throw erro;
-  }
-
-  const prompt = compactarPromptFlux(promptVisual);
-
-  if (!prompt) {
-    const erro = new Error('O prompt visual está vazio.');
-    erro.statusCode = 400;
-    throw erro;
-  }
-
-  logInfo('cloudflare_gerar_imagem', {
-    modelo: CLOUDFLARE_IMAGE_MODEL,
-    promptChars: prompt.length,
-  });
-
-  const controle = withTimeout(TIMEOUT_IMAGEM_MS);
-
-  try {
-    const resposta = await fetch(urlCloudflareImagem(), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        prompt,
-      }),
-      signal: controle.signal,
-    });
-
-    const contentType = String(resposta.headers.get('content-type') || '');
-
-    if (!resposta.ok) {
-      const detalhe = limitarTextoPorCaracteres(await resposta.text(), 1200);
-      const erro = new Error(
-        `Cloudflare retornou HTTP ${resposta.status}: ${detalhe}`
-      );
-      erro.statusCode = resposta.status;
-      throw erro;
-    }
-
-    if (contentType.startsWith('image/')) {
-      const arrayBuffer = await resposta.arrayBuffer();
-      return {
-        imagemBase64: Buffer.from(arrayBuffer).toString('base64'),
-        mimeType: contentType.split(';')[0] || 'image/png',
-      };
-    }
-
-    const texto = await resposta.text();
-    let dados;
-
-    try {
-      dados = JSON.parse(texto);
-    } catch (_) {
-      dados = texto;
-    }
-
-    const imagemBase64 = extrairImagemCloudflare(dados);
-
-    if (!imagemBase64) {
-      throw new Error('O Cloudflare não retornou uma imagem utilizável.');
-    }
-
-    return {
-      imagemBase64,
-      mimeType: 'image/png',
-    };
-  } finally {
-    controle.cancelar();
-  }
-}
-
-// ----------------------------------------------------------------
-// GEMINI IMAGE - EDIÇÃO DE IMAGEM DE REFERÊNCIA
-// ----------------------------------------------------------------
 
 function extrairImagemGemini(dados) {
   const candidatos = Array.isArray(dados?.candidates) ? dados.candidates : [];
@@ -883,32 +730,25 @@ function extrairImagemGemini(dados) {
   return null;
 }
 
-async function editarImagemGemini({ promptVisual, imagens }) {
+async function gerarOuEditarImagemGemini({ promptVisual, imagens = [] }) {
   if (!GEMINI_API_KEY) {
     const erro = new Error('GEMINI_API_KEY não está configurada no Render.');
     erro.statusCode = 503;
     throw erro;
   }
 
-  if (!Array.isArray(imagens) || imagens.length === 0) {
-    const erro = new Error(
-      'É necessária uma imagem de referência para realizar a edição.'
-    );
-    erro.statusCode = 400;
-    throw erro;
-  }
+  const referencias = Array.isArray(imagens) ? imagens.slice(0, 3) : [];
+  const editando = referencias.length > 0;
 
   const partes = [
     {
-      text:
-        'Edite a imagem de referência conforme o pedido abaixo. ' +
-        'Preserve tudo que não foi solicitado para mudar. ' +
-        'O resultado deve permanecer coerente com construção civil.\n\n' +
-        limitarTextoPorCaracteres(promptVisual, 1500),
+      text: editando
+        ? 'Edite a imagem de referência conforme o pedido abaixo. Preserve a identidade visual da construção, composição, materiais, proporções, fachada, telhado, aberturas e demais elementos que não foram solicitados para mudar. Faça somente as alterações pedidas, salvo quando uma adaptação for indispensável para coerência física. O resultado deve permanecer coerente com construção civil.\n\n' + limitarTextoPorCaracteres(promptVisual, 3000)
+        : 'Crie uma imagem nova conforme o pedido abaixo. O resultado deve ser coerente com construção civil, com proporções plausíveis e respeitando todos os requisitos descritos. Quando o pedido exigir realismo, use aparência fotográfica arquitetônica realista, materiais reais, escala real e iluminação natural, sem aparência de maquete.\n\n' + limitarTextoPorCaracteres(promptVisual, 3000),
     },
   ];
 
-  for (const imagem of imagens.slice(0, 3)) {
+  for (const imagem of referencias) {
     partes.push({
       inlineData: {
         mimeType: imagem.mimeType,
@@ -918,24 +758,22 @@ async function editarImagemGemini({ promptVisual, imagens }) {
   }
 
   const corpo = {
-    contents: [
-      {
-        role: 'user',
-        parts: partes,
-      },
-    ],
+    contents: [{ role: 'user', parts: partes }],
     generationConfig: {
       responseModalities: ['TEXT', 'IMAGE'],
     },
   };
 
+  logInfo(editando ? 'gemini_editar_imagem' : 'gemini_gerar_imagem', {
+    modelo: GEMINI_IMAGE_MODEL,
+    referencias: referencias.length,
+  });
+
   const { data } = await fetchJson(
     urlGemini(GEMINI_IMAGE_MODEL),
     {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(corpo),
     },
     TIMEOUT_IMAGEM_MS
@@ -948,10 +786,7 @@ async function editarImagemGemini({ promptVisual, imagens }) {
       data?.candidates?.[0]?.finishReason ||
       data?.promptFeedback?.blockReason ||
       'sem imagem';
-
-    throw new Error(
-      `O Gemini não retornou a imagem editada (${motivo}).`
-    );
+    throw new Error(`O Gemini não retornou uma imagem (${motivo}).`);
   }
 
   return imagem;
@@ -986,11 +821,21 @@ async function processarPedido({
   mensagem,
   historico,
   arquivos,
+  imagemAnterior,
   forcarFluxoVisual = false,
 }) {
   const mensagemLimpa = textoSeguro(mensagem, 12000);
   const historicoLimpo = normalizarHistorico(historico);
   const arquivosLimpos = validarArquivos(arquivos);
+  const imagemAnteriorLimpa = imagemAnterior
+    ? validarArquivos([imagemAnterior])[0]
+    : null;
+
+  if (imagemAnteriorLimpa && !imagemAnteriorLimpa.ehImagem) {
+    const erro = new Error('A memória visual anterior precisa ser uma imagem.');
+    erro.statusCode = 400;
+    throw erro;
+  }
 
   if (!mensagemLimpa && arquivosLimpos.length === 0) {
     const erro = new Error('Envie uma mensagem ou pelo menos um arquivo.');
@@ -1003,6 +848,7 @@ async function processarPedido({
     historico: historicoLimpo,
     arquivos: arquivosLimpos,
     forcarImagem: forcarFluxoVisual,
+    temImagemAnteriorDisponivel: Boolean(imagemAnteriorLimpa),
   });
 
   logInfo('jisa_decisao', {
@@ -1036,9 +882,20 @@ async function processarPedido({
   }
 
   if (decisao.acao === 'editar_imagem') {
-    const imagens = arquivosLimpos.filter((arquivo) => arquivo.ehImagem);
+    const imagensEnviadas = arquivosLimpos.filter((arquivo) => arquivo.ehImagem);
+    const imagens = imagensEnviadas.length > 0
+      ? imagensEnviadas
+      : imagemAnteriorLimpa
+        ? [imagemAnteriorLimpa]
+        : [];
 
-    const imagem = await editarImagemGemini({
+    if (imagens.length === 0) {
+      const erro = new Error('Não encontrei a imagem anterior para continuar a edição.');
+      erro.statusCode = 400;
+      throw erro;
+    }
+
+    const imagem = await gerarOuEditarImagemGemini({
       promptVisual:
         decisao.promptVisual ||
         mensagemLimpa ||
@@ -1060,7 +917,10 @@ async function processarPedido({
     decisao.promptVisual ||
     limitarTextoPorCaracteres(mensagemLimpa, 1500);
 
-  const imagem = await gerarImagemCloudflare(promptVisual);
+  const imagem = await gerarOuEditarImagemGemini({
+    promptVisual,
+    imagens: [],
+  });
 
   return {
     ok: true,
@@ -1109,15 +969,12 @@ app.get('/health', (_req, res) => {
     servico: 'acheobra-ai-backend',
     jisa: 'online',
     cerebro: 'Gemini',
-    geradorImagem: 'Cloudflare FLUX',
+    geradorImagem: 'Gemini',
     configuracao: {
       gemini: Boolean(GEMINI_API_KEY),
-      cloudflare:
-        Boolean(CLOUDFLARE_ACCOUNT_ID) &&
-        Boolean(CLOUDFLARE_API_TOKEN),
       modeloPrincipal: GEMINI_MAIN_MODEL,
       modeloFallback: GEMINI_FALLBACK_MODEL,
-      modeloImagem: CLOUDFLARE_IMAGE_MODEL,
+      modeloImagem: GEMINI_IMAGE_MODEL,
     },
   });
 });
@@ -1134,6 +991,7 @@ app.post('/ia/processar', async (req, res) => {
       mensagem: req.body?.mensagem,
       historico: req.body?.historico,
       arquivos: req.body?.arquivos,
+      imagemAnterior: req.body?.imagemAnterior,
       forcarFluxoVisual: false,
     });
 
@@ -1170,6 +1028,7 @@ app.post('/ia/perguntar', async (req, res) => {
       historico,
       arquivos: arquivosLimpos,
       forcarImagem: false,
+      temImagemAnteriorDisponivel: Boolean(req.body?.imagemAnterior),
     });
 
     if (decisao.acao === 'fora_escopo') {
@@ -1187,6 +1046,7 @@ app.post('/ia/perguntar', async (req, res) => {
         mensagem,
         historico,
         arquivos,
+        imagemAnterior: req.body?.imagemAnterior,
         forcarFluxoVisual: true,
       });
 
@@ -1230,6 +1090,7 @@ app.post('/ia/gerar-imagem', async (req, res) => {
       mensagem,
       historico: req.body?.historico,
       arquivos: req.body?.arquivos,
+      imagemAnterior: req.body?.imagemAnterior,
       forcarFluxoVisual: true,
     });
 
@@ -1337,7 +1198,7 @@ app.listen(PORT, '0.0.0.0', () => {
     cerebro: 'Gemini',
     modeloPrincipal: GEMINI_MAIN_MODEL,
     modeloFallback: GEMINI_FALLBACK_MODEL,
-    cloudflareImagem: CLOUDFLARE_IMAGE_MODEL,
+    modeloImagem: GEMINI_IMAGE_MODEL,
   });
 });
 
