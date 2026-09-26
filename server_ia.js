@@ -809,7 +809,6 @@ async function gerarImagemCloudflare(promptVisual) {
       },
       body: JSON.stringify({
         prompt,
-        num_steps: 8,
       }),
       signal: controle.signal,
     });
