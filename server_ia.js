@@ -176,6 +176,14 @@ function limitarTextoPorCaracteres(texto, limite) {
   return valor.slice(0, limite).trim();
 }
 
+// Remove artefatos de formatação que eventualmente podem vir na resposta
+// textual do modelo, como o marcador literal "$1" antes de itens de lista.
+function limparArtefatosResposta(texto) {
+  return String(texto || '')
+    .replace(/(^|\n)(\s*(?:[-*•]|\d+[.)])?\s*)\$1(?=\s)/g, '$1$2')
+    .trim();
+}
+
 function removerCercasJson(texto) {
   return String(texto || '')
     .trim()
@@ -801,7 +809,7 @@ async function responderTextoJisa({
   historico = [],
   arquivos = [],
 }) {
-  return chamarGeminiTexto({
+  const resposta = await chamarGeminiTexto({
     mensagem:
       textoSeguro(mensagem, 12000) ||
       (arquivos.length ? 'Analise os arquivos enviados.' : 'Olá'),
@@ -811,6 +819,8 @@ async function responderTextoJisa({
     temperature: 0.35,
     maxOutputTokens: 1800,
   });
+
+  return limparArtefatosResposta(resposta);
 }
 
 // ----------------------------------------------------------------
