@@ -29,7 +29,7 @@
 
 'use strict';
 
-const express = require('express');
+import express from 'express';
 
 const app = express();
 
@@ -1331,17 +1331,15 @@ app.use((erro, _req, res, _next) => {
 // INICIALIZAÇÃO
 // ----------------------------------------------------------------
 
-if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => {
-    logInfo('servidor_iniciado', {
-      porta: PORT,
-      especialidade: 'construcao_civil',
-      cerebro: 'Gemini',
-      modeloPrincipal: GEMINI_MAIN_MODEL,
-      modeloFallback: GEMINI_FALLBACK_MODEL,
-      cloudflareImagem: CLOUDFLARE_IMAGE_MODEL,
-    });
+app.listen(PORT, '0.0.0.0', () => {
+  logInfo('servidor_iniciado', {
+    porta: PORT,
+    especialidade: 'construcao_civil',
+    cerebro: 'Gemini',
+    modeloPrincipal: GEMINI_MAIN_MODEL,
+    modeloFallback: GEMINI_FALLBACK_MODEL,
+    cloudflareImagem: CLOUDFLARE_IMAGE_MODEL,
   });
-}
+});
 
-module.exports = app;
+export default app;
