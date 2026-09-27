@@ -58,9 +58,43 @@ const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
 // descobrir o plano ativo e controlar a franquia mensal de imagens.
 // Use SUPABASE_SECRET_KEY (recomendado) ou, durante a migração,
 // SUPABASE_SERVICE_ROLE_KEY. Nunca exponha essa chave no Flutter.
-const SUPABASE_URL = String(process.env.SUPABASE_URL || '')
-  .trim()
-  .replace(/\/+$/, '');
+// URL canônica do projeto Supabase do Ache Obra.
+// A variável do Render continua sendo aceita, mas o backend corrige
+// automaticamente o hostname legado incorreto que causava ENOTFOUND.
+const SUPABASE_PROJECT_REF = 'nqmullubdvzzrueocxhd';
+const SUPABASE_URL_CANONICA = `https://${SUPABASE_PROJECT_REF}.supabase.co`;
+
+function normalizarSupabaseUrl(valor) {
+  let url = String(valor || '').trim();
+
+  // Remove caminhos que possam ter sido colados por engano no Render.
+  url = url
+    .replace(/\/+$/, '')
+    .replace(/\/rest\/v1\/?$/i, '')
+    .replace(/\/auth\/v1\/?$/i, '');
+
+  if (!url) return SUPABASE_URL_CANONICA;
+
+  if (!/^https?:\/\//i.test(url)) {
+    url = `https://${url}`;
+  }
+
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+
+    // Host incorreto observado nos logs do Render.
+    if (host === 'nqmllubdvzzrueocxhd.supabase.co') {
+      return SUPABASE_URL_CANONICA;
+    }
+
+    return `${parsed.protocol}//${parsed.host}`.replace(/\/+$/, '');
+  } catch (_) {
+    return SUPABASE_URL_CANONICA;
+  }
+}
+
+const SUPABASE_URL = normalizarSupabaseUrl(process.env.SUPABASE_URL);
 const SUPABASE_SECRET_KEY = String(
   process.env.SUPABASE_SECRET_KEY ||
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
@@ -1728,6 +1762,7 @@ app.listen(PORT, '0.0.0.0', () => {
     modeloImagem: OPENAI_IMAGE_MODEL,
     qualidadeImagem: OPENAI_IMAGE_QUALITY,
     controleImagensPorPlano: configuracaoSupabaseOk(),
+    supabaseHost: SUPABASE_URL ? urlSeguraParaLog(SUPABASE_URL) : '',
   });
 });
 
