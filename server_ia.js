@@ -59,6 +59,16 @@ const SUPABASE_SECRET_KEY = String(
   ''
 ).trim();
 
+// Controle de franquia de imagens.
+// Enquanto SUPABASE_URL + chave secreta não estiverem configuradas no Render,
+// a geração de imagens continua funcionando e o servidor registra um aviso.
+// Assim a integração da OpenAI não é derrubada por uma configuração incompleta
+// do controle de planos. Quando as variáveis forem configuradas, o controle
+// passa a ser aplicado automaticamente.
+const CONTROLE_IMAGENS_CONFIGURADO = Boolean(
+  SUPABASE_URL && SUPABASE_SECRET_KEY
+);
+
 const TABELA_USUARIOS = 'tab_usuarios';
 const TABELA_PLANOS = 'tab_planos';
 const RPC_RESERVAR_IMAGEM_IA = 'reservar_imagem_ia';
@@ -493,7 +503,7 @@ function headersOpenAI() {
 // ----------------------------------------------------------------
 
 function configuracaoSupabaseOk() {
-  return Boolean(SUPABASE_URL && SUPABASE_SECRET_KEY);
+  return CONTROLE_IMAGENS_CONFIGURADO;
 }
 
 function headersSupabaseAdmin(extras = {}) {
@@ -693,6 +703,18 @@ function normalizarRetornoFranquia(data, planoFallback = null) {
 }
 
 async function reservarUsoImagemIa(req) {
+  // A IA não deve parar de gerar imagens apenas porque o controle de franquia
+  // ainda não foi configurado no Render. Sem as variáveis do Supabase,
+  // seguimos sem reserva e sem contabilização. Assim que forem configuradas,
+  // o fluxo abaixo passa a validar usuário, plano e limite normalmente.
+  if (!configuracaoSupabaseOk()) {
+    logInfo('ia_controle_imagens_nao_configurado', {
+      mensagem:
+        'SUPABASE_URL/SUPABASE_SECRET_KEY ausentes; imagem liberada sem contabilização.',
+    });
+    return null;
+  }
+
   const usuario = await autenticarUsuarioSupabase(req);
   const plano = await buscarPlanoImagemUsuario(usuario.id);
 
@@ -1368,7 +1390,7 @@ app.get('/health', (_req, res) => {
     configuracao: {
       openai: Boolean(OPENAI_API_KEY),
       supabase: configuracaoSupabaseOk(),
-      controleImagensPorPlano: true,
+      controleImagensPorPlano: configuracaoSupabaseOk(),
       modeloPrincipal: OPENAI_MAIN_MODEL,
       modeloImagem: OPENAI_IMAGE_MODEL,
       qualidadeImagem: OPENAI_IMAGE_QUALITY,
@@ -1608,6 +1630,7 @@ app.listen(PORT, '0.0.0.0', () => {
     cerebro: OPENAI_MAIN_MODEL,
     modeloImagem: OPENAI_IMAGE_MODEL,
     qualidadeImagem: OPENAI_IMAGE_QUALITY,
+    controleImagensPorPlano: configuracaoSupabaseOk(),
   });
 });
 
