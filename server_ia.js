@@ -31,6 +31,14 @@
 'use strict';
 
 import express from 'express';
+import dns from 'node:dns';
+
+// Render/Node pode resolver hosts por IPv6 primeiro. Em algumas instâncias
+// isso causa `fetch failed` mesmo com a URL correta. Priorizamos IPv4,
+// mantendo fallback normal do Node.
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch (_) {}
 
 const app = express();
 
@@ -438,14 +446,62 @@ function withTimeout(ms) {
   };
 }
 
+function urlSeguraParaLog(url) {
+  try {
+    const u = new URL(String(url || ''));
+    return `${u.origin}${u.pathname}`;
+  } catch (_) {
+    return limitarTextoPorCaracteres(String(url || ''), 300);
+  }
+}
+
+function detalhesErroFetch(erro) {
+  const causa = erro?.cause || null;
+  return {
+    nome: textoSeguro(erro?.name, 100),
+    mensagem: textoSeguro(erro?.message, 500),
+    causaNome: textoSeguro(causa?.name, 100),
+    causaMensagem: textoSeguro(causa?.message, 500),
+    causaCodigo: textoSeguro(causa?.code, 100),
+    causaErrno: textoSeguro(causa?.errno, 100),
+    causaSyscall: textoSeguro(causa?.syscall, 100),
+    causaHostname: textoSeguro(causa?.hostname, 300),
+  };
+}
+
 async function fetchJson(url, opcoes = {}, timeoutMs = 60000) {
   const controle = withTimeout(timeoutMs);
+  const metodo = String(opcoes?.method || 'GET').toUpperCase();
+  const urlLog = urlSeguraParaLog(url);
 
   try {
-    const resposta = await fetch(url, {
-      ...opcoes,
-      signal: controle.signal,
-    });
+    let resposta;
+
+    try {
+      resposta = await fetch(url, {
+        ...opcoes,
+        signal: controle.signal,
+      });
+    } catch (erroFetch) {
+      // Mantém o AbortError intacto para o tratamento de timeout existente.
+      if (erroFetch?.name === 'AbortError') throw erroFetch;
+
+      const diagnostico = detalhesErroFetch(erroFetch);
+      logErro('fetch_rede_falhou', erroFetch, {
+        metodo,
+        url: urlLog,
+        ...diagnostico,
+      });
+
+      const erro = new Error(
+        `Falha de rede ao acessar ${urlLog}: ` +
+        `${diagnostico.causaCodigo || diagnostico.causaMensagem || diagnostico.mensagem || 'fetch failed'}`
+      );
+      erro.statusCode = 503;
+      erro.codigo = 'FALHA_REDE_EXTERNA';
+      erro.fetchDiagnostico = diagnostico;
+      throw erro;
+    }
 
     const texto = await resposta.text();
     let dados = null;
@@ -461,6 +517,8 @@ async function fetchJson(url, opcoes = {}, timeoutMs = 60000) {
         typeof dados === 'string'
           ? dados
           : dados?.error?.message ||
+            dados?.message ||
+            dados?.msg ||
             dados?.errors?.[0]?.message ||
             JSON.stringify(dados || {});
 
@@ -469,6 +527,8 @@ async function fetchJson(url, opcoes = {}, timeoutMs = 60000) {
       );
       erro.statusCode = resposta.status;
       erro.responseData = dados;
+      erro.urlExterna = urlLog;
+      erro.metodoExterno = metodo;
       throw erro;
     }
 
@@ -547,17 +607,31 @@ async function autenticarUsuarioSupabase(req) {
     throw erro;
   }
 
-  const { data } = await fetchJson(
-    `${SUPABASE_URL}/auth/v1/user`,
-    {
-      method: 'GET',
-      headers: {
-        apikey: SUPABASE_SECRET_KEY,
-        Authorization: `Bearer ${token}`,
+  let data;
+
+  try {
+    const resposta = await fetchJson(
+      `${SUPABASE_URL}/auth/v1/user`,
+      {
+        method: 'GET',
+        headers: {
+          apikey: SUPABASE_SECRET_KEY,
+          Authorization: `Bearer ${token}`,
+        },
       },
-    },
-    15000
-  );
+      15000
+    );
+    data = resposta.data;
+  } catch (erro) {
+    logErro('supabase_auth_usuario_falhou', erro, {
+      etapa: 'auth_v1_user',
+      supabaseHost: urlSeguraParaLog(SUPABASE_URL),
+      statusExterno: Number(erro?.statusCode || 0) || undefined,
+      codigoExterno: textoSeguro(erro?.codigo, 100) || undefined,
+      fetchDiagnostico: erro?.fetchDiagnostico || undefined,
+    });
+    throw erro;
+  }
 
   const usuarioId = textoSeguro(data?.id, 100);
 
@@ -584,16 +658,30 @@ async function supabaseSelecionarUm(tabela, filtros, select) {
 
   params.set('limit', '1');
 
-  const { data } = await fetchJson(
-    `${SUPABASE_URL}/rest/v1/${encodeURIComponent(tabela)}?${params.toString()}`,
-    {
-      method: 'GET',
-      headers: headersSupabaseAdmin({
-        Accept: 'application/json',
-      }),
-    },
-    15000
-  );
+  let data;
+
+  try {
+    const resposta = await fetchJson(
+      `${SUPABASE_URL}/rest/v1/${encodeURIComponent(tabela)}?${params.toString()}`,
+      {
+        method: 'GET',
+        headers: headersSupabaseAdmin({
+          Accept: 'application/json',
+        }),
+      },
+      15000
+    );
+    data = resposta.data;
+  } catch (erro) {
+    logErro('supabase_select_falhou', erro, {
+      etapa: 'rest_select',
+      tabela: textoSeguro(tabela, 100),
+      statusExterno: Number(erro?.statusCode || 0) || undefined,
+      codigoExterno: textoSeguro(erro?.codigo, 100) || undefined,
+      fetchDiagnostico: erro?.fetchDiagnostico || undefined,
+    });
+    throw erro;
+  }
 
   return Array.isArray(data) && data.length > 0 ? data[0] : null;
 }
@@ -652,19 +740,30 @@ async function buscarPlanoImagemUsuario(usuarioId) {
 }
 
 async function chamarRpcSupabase(nomeFuncao, corpo) {
-  const { data } = await fetchJson(
-    `${SUPABASE_URL}/rest/v1/rpc/${encodeURIComponent(nomeFuncao)}`,
-    {
-      method: 'POST',
-      headers: headersSupabaseAdmin({
-        Accept: 'application/json',
-      }),
-      body: JSON.stringify(corpo || {}),
-    },
-    15000
-  );
+  try {
+    const { data } = await fetchJson(
+      `${SUPABASE_URL}/rest/v1/rpc/${encodeURIComponent(nomeFuncao)}`,
+      {
+        method: 'POST',
+        headers: headersSupabaseAdmin({
+          Accept: 'application/json',
+        }),
+        body: JSON.stringify(corpo || {}),
+      },
+      15000
+    );
 
-  return data;
+    return data;
+  } catch (erro) {
+    logErro('supabase_rpc_falhou', erro, {
+      etapa: 'rest_rpc',
+      rpc: textoSeguro(nomeFuncao, 120),
+      statusExterno: Number(erro?.statusCode || 0) || undefined,
+      codigoExterno: textoSeguro(erro?.codigo, 100) || undefined,
+      fetchDiagnostico: erro?.fetchDiagnostico || undefined,
+    });
+    throw erro;
+  }
 }
 
 function normalizarRetornoFranquia(data, planoFallback = null) {
@@ -1387,6 +1486,7 @@ app.get('/health', (_req, res) => {
     configuracao: {
       openai: Boolean(OPENAI_API_KEY),
       supabase: configuracaoSupabaseOk(),
+      supabaseHost: SUPABASE_URL ? urlSeguraParaLog(SUPABASE_URL) : '',
       controleImagensPorPlano: configuracaoSupabaseOk(),
       modeloPrincipal: OPENAI_MAIN_MODEL,
       modeloImagem: OPENAI_IMAGE_MODEL,
