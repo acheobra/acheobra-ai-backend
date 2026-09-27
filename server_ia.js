@@ -60,11 +60,9 @@ const SUPABASE_SECRET_KEY = String(
 ).trim();
 
 // Controle de franquia de imagens.
-// Enquanto SUPABASE_URL + chave secreta não estiverem configuradas no Render,
-// a geração de imagens continua funcionando e o servidor registra um aviso.
-// Assim a integração da OpenAI não é derrubada por uma configuração incompleta
-// do controle de planos. Quando as variáveis forem configuradas, o controle
-// passa a ser aplicado automaticamente.
+// O controle de franquia é obrigatório para qualquer geração/edição de imagem.
+// Se SUPABASE_URL + chave secreta não estiverem configuradas no Render,
+// a geração visual é bloqueada. Isso impede bypass do limite do plano.
 const CONTROLE_IMAGENS_CONFIGURADO = Boolean(
   SUPABASE_URL && SUPABASE_SECRET_KEY
 );
@@ -703,16 +701,15 @@ function normalizarRetornoFranquia(data, planoFallback = null) {
 }
 
 async function reservarUsoImagemIa(req) {
-  // A IA não deve parar de gerar imagens apenas porque o controle de franquia
-  // ainda não foi configurado no Render. Sem as variáveis do Supabase,
-  // seguimos sem reserva e sem contabilização. Assim que forem configuradas,
-  // o fluxo abaixo passa a validar usuário, plano e limite normalmente.
+  // FAIL CLOSED: imagem só pode ser gerada/editada depois de reservar franquia.
+  // Sem Supabase configurado, nunca liberamos geração sem contabilização.
   if (!configuracaoSupabaseOk()) {
-    logInfo('ia_controle_imagens_nao_configurado', {
-      mensagem:
-        'SUPABASE_URL/SUPABASE_SECRET_KEY ausentes; imagem liberada sem contabilização.',
-    });
-    return null;
+    const erro = new Error(
+      'O controle de imagens da Jisa está temporariamente indisponível. Tente novamente em instantes.'
+    );
+    erro.statusCode = 503;
+    erro.codigo = 'CONTROLE_IMAGENS_INDISPONIVEL';
+    throw erro;
   }
 
   const usuario = await autenticarUsuarioSupabase(req);
@@ -759,7 +756,7 @@ async function reservarUsoImagemIa(req) {
 
   if (!franquia.permitido) {
     const erro = new Error(
-      `Você atingiu o limite de ${franquia.limite} imagem(ns) por mês do plano ${franquia.nomePlano}.`
+      `Você atingiu o limite de ${franquia.limite} imagem(ns) da Jisa neste mês no plano ${franquia.nomePlano}. Adquira um plano com mais imagens para continuar gerando.`
     );
     erro.statusCode = 403;
     erro.codigo = 'LIMITE_IMAGENS_IA_ATINGIDO';
