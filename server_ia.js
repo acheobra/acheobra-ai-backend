@@ -46,6 +46,24 @@ const PORT = Number(process.env.PORT || 10000);
 
 const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
 
+// Supabase é usado somente no backend para autenticar o usuário,
+// descobrir o plano ativo e controlar a franquia mensal de imagens.
+// Use SUPABASE_SECRET_KEY (recomendado) ou, durante a migração,
+// SUPABASE_SERVICE_ROLE_KEY. Nunca exponha essa chave no Flutter.
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '')
+  .trim()
+  .replace(/\/+$/, '');
+const SUPABASE_SECRET_KEY = String(
+  process.env.SUPABASE_SECRET_KEY ||
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  ''
+).trim();
+
+const TABELA_USUARIOS = 'tab_usuarios';
+const TABELA_PLANOS = 'tab_planos';
+const RPC_RESERVAR_IMAGEM_IA = 'reservar_imagem_ia';
+const RPC_ESTORNAR_IMAGEM_IA = 'estornar_imagem_ia';
+
 // Modelo principal: conversa, contexto, visão, análise e orquestração.
 const OPENAI_MAIN_MODEL = String(
   process.env.OPENAI_MAIN_MODEL || 'gpt-5.6-luna'
@@ -469,6 +487,322 @@ function headersOpenAI() {
   };
 }
 
+
+// ----------------------------------------------------------------
+// SUPABASE - AUTENTICAÇÃO / PLANO / FRANQUIA DE IMAGENS DA JISA
+// ----------------------------------------------------------------
+
+function configuracaoSupabaseOk() {
+  return Boolean(SUPABASE_URL && SUPABASE_SECRET_KEY);
+}
+
+function headersSupabaseAdmin(extras = {}) {
+  if (!configuracaoSupabaseOk()) {
+    const erro = new Error(
+      'SUPABASE_URL e SUPABASE_SECRET_KEY não estão configuradas no Render.'
+    );
+    erro.statusCode = 503;
+    throw erro;
+  }
+
+  return {
+    apikey: SUPABASE_SECRET_KEY,
+    Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+    'Content-Type': 'application/json',
+    ...extras,
+  };
+}
+
+function extrairBearer(req) {
+  const authorization = String(req?.headers?.authorization || '').trim();
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+}
+
+async function autenticarUsuarioSupabase(req) {
+  const token = extrairBearer(req);
+
+  if (!token) {
+    const erro = new Error(
+      'Sua sessão não foi identificada. Entre novamente no Ache Obra e tente de novo.'
+    );
+    erro.statusCode = 401;
+    erro.codigo = 'SESSAO_NAO_IDENTIFICADA';
+    throw erro;
+  }
+
+  if (!configuracaoSupabaseOk()) {
+    const erro = new Error(
+      'O controle de imagens da Jisa ainda não está configurado no servidor.'
+    );
+    erro.statusCode = 503;
+    throw erro;
+  }
+
+  const { data } = await fetchJson(
+    `${SUPABASE_URL}/auth/v1/user`,
+    {
+      method: 'GET',
+      headers: {
+        apikey: SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${token}`,
+      },
+    },
+    15000
+  );
+
+  const usuarioId = textoSeguro(data?.id, 100);
+
+  if (!usuarioId) {
+    const erro = new Error('Não foi possível identificar o usuário autenticado.');
+    erro.statusCode = 401;
+    erro.codigo = 'USUARIO_NAO_IDENTIFICADO';
+    throw erro;
+  }
+
+  return {
+    id: usuarioId,
+    email: textoSeguro(data?.email, 300),
+  };
+}
+
+async function supabaseSelecionarUm(tabela, filtros, select) {
+  const params = new URLSearchParams();
+  params.set('select', select);
+
+  for (const [campo, valor] of Object.entries(filtros || {})) {
+    params.set(campo, `eq.${valor}`);
+  }
+
+  params.set('limit', '1');
+
+  const { data } = await fetchJson(
+    `${SUPABASE_URL}/rest/v1/${encodeURIComponent(tabela)}?${params.toString()}`,
+    {
+      method: 'GET',
+      headers: headersSupabaseAdmin({
+        Accept: 'application/json',
+      }),
+    },
+    15000
+  );
+
+  return Array.isArray(data) && data.length > 0 ? data[0] : null;
+}
+
+async function buscarPlanoImagemUsuario(usuarioId) {
+  const usuario = await supabaseSelecionarUm(
+    TABELA_USUARIOS,
+    { id: usuarioId },
+    'id,id_plano_atual,plano_id,nome_plano_ativo'
+  );
+
+  if (!usuario) {
+    const erro = new Error(
+      'Não foi encontrado o cadastro do usuário para verificar o plano da Jisa.'
+    );
+    erro.statusCode = 403;
+    erro.codigo = 'CADASTRO_USUARIO_NAO_ENCONTRADO';
+    throw erro;
+  }
+
+  const planoId = usuario.id_plano_atual ?? usuario.plano_id;
+
+  if (planoId === null || planoId === undefined || String(planoId).trim() === '') {
+    const erro = new Error(
+      'Não foi possível identificar o plano ativo deste usuário.'
+    );
+    erro.statusCode = 403;
+    erro.codigo = 'PLANO_NAO_IDENTIFICADO';
+    throw erro;
+  }
+
+  const plano = await supabaseSelecionarUm(
+    TABELA_PLANOS,
+    { id: planoId },
+    'id,nome_plano,limite_imagens_ia'
+  );
+
+  if (!plano) {
+    const erro = new Error('O plano ativo do usuário não foi encontrado.');
+    erro.statusCode = 403;
+    erro.codigo = 'PLANO_NAO_ENCONTRADO';
+    throw erro;
+  }
+
+  const limite = Math.max(0, Number.parseInt(plano.limite_imagens_ia, 10) || 0);
+
+  return {
+    usuarioId,
+    planoId: plano.id,
+    nomePlano: textoSeguro(
+      plano.nome_plano || usuario.nome_plano_ativo || 'Plano',
+      200
+    ),
+    limite,
+  };
+}
+
+async function chamarRpcSupabase(nomeFuncao, corpo) {
+  const { data } = await fetchJson(
+    `${SUPABASE_URL}/rest/v1/rpc/${encodeURIComponent(nomeFuncao)}`,
+    {
+      method: 'POST',
+      headers: headersSupabaseAdmin({
+        Accept: 'application/json',
+      }),
+      body: JSON.stringify(corpo || {}),
+    },
+    15000
+  );
+
+  return data;
+}
+
+function normalizarRetornoFranquia(data, planoFallback = null) {
+  const bruto = Array.isArray(data) ? data[0] : data;
+  const valor =
+    bruto && typeof bruto === 'object'
+      ? bruto
+      : {};
+
+  const limite = Math.max(
+    0,
+    Number.parseInt(valor.limite ?? planoFallback?.limite ?? 0, 10) || 0
+  );
+  const utilizado = Math.max(
+    0,
+    Number.parseInt(valor.utilizado ?? valor.usado ?? 0, 10) || 0
+  );
+  const restante = Math.max(
+    0,
+    Number.parseInt(valor.restante ?? (limite - utilizado), 10) || 0
+  );
+
+  return {
+    permitido: valor.permitido !== false && utilizado <= limite,
+    limite,
+    utilizado,
+    restante,
+    nomePlano: textoSeguro(
+      valor.nome_plano || planoFallback?.nomePlano || 'Plano',
+      200
+    ),
+    periodo: textoSeguro(valor.periodo, 20),
+  };
+}
+
+async function reservarUsoImagemIa(req) {
+  const usuario = await autenticarUsuarioSupabase(req);
+  const plano = await buscarPlanoImagemUsuario(usuario.id);
+
+  if (plano.limite <= 0) {
+    const erro = new Error(
+      `Seu plano ${plano.nomePlano} não possui imagens da Jisa IA disponíveis neste mês.`
+    );
+    erro.statusCode = 403;
+    erro.codigo = 'LIMITE_IMAGENS_IA_ATINGIDO';
+    erro.franquiaImagem = {
+      permitido: false,
+      limite: plano.limite,
+      utilizado: 0,
+      restante: 0,
+      nomePlano: plano.nomePlano,
+    };
+    throw erro;
+  }
+
+  let data;
+
+  try {
+    data = await chamarRpcSupabase(RPC_RESERVAR_IMAGEM_IA, {
+      p_usuario_id: usuario.id,
+    });
+  } catch (erroRpc) {
+    // Erro de configuração do banco não deve liberar geração sem controle.
+    logErro('ia_reserva_imagem_rpc', erroRpc, {
+      usuarioId: usuario.id,
+      planoId: plano.planoId,
+    });
+
+    const erro = new Error(
+      'Não foi possível verificar sua franquia de imagens neste momento.'
+    );
+    erro.statusCode = 503;
+    erro.codigo = 'CONTROLE_IMAGENS_INDISPONIVEL';
+    throw erro;
+  }
+
+  const franquia = normalizarRetornoFranquia(data, plano);
+
+  if (!franquia.permitido) {
+    const erro = new Error(
+      `Você atingiu o limite de ${franquia.limite} imagem(ns) por mês do plano ${franquia.nomePlano}.`
+    );
+    erro.statusCode = 403;
+    erro.codigo = 'LIMITE_IMAGENS_IA_ATINGIDO';
+    erro.franquiaImagem = franquia;
+    throw erro;
+  }
+
+  logInfo('ia_imagem_reservada', {
+    usuarioId: usuario.id,
+    planoId: plano.planoId,
+    limite: franquia.limite,
+    utilizado: franquia.utilizado,
+    restante: franquia.restante,
+  });
+
+  return {
+    usuario,
+    plano,
+    franquia,
+  };
+}
+
+async function estornarUsoImagemIa(reserva, motivo = '') {
+  const usuarioId = textoSeguro(reserva?.usuario?.id, 100);
+  if (!usuarioId) return;
+
+  try {
+    const data = await chamarRpcSupabase(RPC_ESTORNAR_IMAGEM_IA, {
+      p_usuario_id: usuarioId,
+    });
+
+    const franquia = normalizarRetornoFranquia(data, reserva?.plano);
+
+    logInfo('ia_imagem_estornada', {
+      usuarioId,
+      motivo: textoSeguro(motivo, 300),
+      limite: franquia.limite,
+      utilizado: franquia.utilizado,
+      restante: franquia.restante,
+    });
+  } catch (erro) {
+    // Não mascara o erro original da OpenAI, mas deixa o problema explícito
+    // no Render para correção administrativa.
+    logErro('ia_estorno_imagem_falhou', erro, {
+      usuarioId,
+      motivo: textoSeguro(motivo, 300),
+    });
+  }
+}
+
+function anexarFranquiaImagem(resultado, reserva) {
+  if (!resultado || !reserva?.franquia) return resultado;
+
+  return {
+    ...resultado,
+    franquiaImagem: {
+      limite: reserva.franquia.limite,
+      utilizado: reserva.franquia.utilizado,
+      restante: reserva.franquia.restante,
+      nomePlano: reserva.franquia.nomePlano,
+      periodo: reserva.franquia.periodo,
+    },
+  };
+}
+
 // ----------------------------------------------------------------
 // OPENAI RESPONSES API - TEXTO / VISÃO / ORQUESTRAÇÃO
 // ----------------------------------------------------------------
@@ -842,6 +1176,7 @@ async function responderTextoJisa({
 // ----------------------------------------------------------------
 
 async function processarPedido({
+  req,
   mensagem,
   historico,
   arquivos,
@@ -928,53 +1263,67 @@ async function processarPedido({
       throw erro;
     }
 
-    const imagem = await gerarOuEditarImagemOpenAI({
-      promptVisual:
-        decisao.promptVisual ||
-        mensagemLimpa ||
-        'Edite a imagem conforme o contexto da conversa.',
-      imagens,
-      historico: historicoLimpo,
-      previousResponseId: previousResponseIdLimpo,
-    });
+    const reserva = await reservarUsoImagemIa(req);
 
-    return {
-      ok: true,
-      tipo: 'imagem',
-      acao: 'editar_imagem',
-      resposta: 'Imagem atualizada pela Jisa.',
-      imagemBase64: imagem.imagemBase64,
-      mimeType: imagem.mimeType,
-      responseId: imagem.responseId,
-      modeloImagem: imagem.modelo,
-      qualidade: imagem.qualidade,
-      tamanho: imagem.tamanho,
-    };
+    try {
+      const imagem = await gerarOuEditarImagemOpenAI({
+        promptVisual:
+          decisao.promptVisual ||
+          mensagemLimpa ||
+          'Edite a imagem conforme o contexto da conversa.',
+        imagens,
+        historico: historicoLimpo,
+        previousResponseId: previousResponseIdLimpo,
+      });
+
+      return anexarFranquiaImagem({
+        ok: true,
+        tipo: 'imagem',
+        acao: 'editar_imagem',
+        resposta: 'Imagem atualizada pela Jisa.',
+        imagemBase64: imagem.imagemBase64,
+        mimeType: imagem.mimeType,
+        responseId: imagem.responseId,
+        modeloImagem: imagem.modelo,
+        qualidade: imagem.qualidade,
+        tamanho: imagem.tamanho,
+      }, reserva);
+    } catch (erro) {
+      await estornarUsoImagemIa(reserva, erro?.message || 'Falha ao editar imagem');
+      throw erro;
+    }
   }
 
   const promptVisual =
     decisao.promptVisual ||
     limitarTextoPorCaracteres(mensagemLimpa, 3000);
 
-  const imagem = await gerarOuEditarImagemOpenAI({
-    promptVisual,
-    imagens: [],
-    historico: historicoLimpo,
-    previousResponseId: '',
-  });
+  const reserva = await reservarUsoImagemIa(req);
 
-  return {
-    ok: true,
-    tipo: 'imagem',
-    acao: 'imagem',
-    resposta: 'Imagem criada pela Jisa.',
-    imagemBase64: imagem.imagemBase64,
-    mimeType: imagem.mimeType,
-    responseId: imagem.responseId,
-    modeloImagem: imagem.modelo,
-    qualidade: imagem.qualidade,
-    tamanho: imagem.tamanho,
-  };
+  try {
+    const imagem = await gerarOuEditarImagemOpenAI({
+      promptVisual,
+      imagens: [],
+      historico: historicoLimpo,
+      previousResponseId: '',
+    });
+
+    return anexarFranquiaImagem({
+      ok: true,
+      tipo: 'imagem',
+      acao: 'imagem',
+      resposta: 'Imagem criada pela Jisa.',
+      imagemBase64: imagem.imagemBase64,
+      mimeType: imagem.mimeType,
+      responseId: imagem.responseId,
+      modeloImagem: imagem.modelo,
+      qualidade: imagem.qualidade,
+      tamanho: imagem.tamanho,
+    }, reserva);
+  } catch (erro) {
+    await estornarUsoImagemIa(reserva, erro?.message || 'Falha ao gerar imagem');
+    throw erro;
+  }
 }
 
 // ----------------------------------------------------------------
@@ -1018,6 +1367,8 @@ app.get('/health', (_req, res) => {
     geradorImagem: 'OpenAI',
     configuracao: {
       openai: Boolean(OPENAI_API_KEY),
+      supabase: configuracaoSupabaseOk(),
+      controleImagensPorPlano: true,
       modeloPrincipal: OPENAI_MAIN_MODEL,
       modeloImagem: OPENAI_IMAGE_MODEL,
       qualidadeImagem: OPENAI_IMAGE_QUALITY,
@@ -1035,6 +1386,7 @@ app.post('/ia/processar', async (req, res) => {
 
   try {
     const resultado = await processarPedido({
+      req,
       mensagem: req.body?.mensagem,
       historico: req.body?.historico,
       arquivos: req.body?.arquivos,
@@ -1065,6 +1417,7 @@ app.post('/ia/perguntar', async (req, res) => {
 
   try {
     const resultado = await processarPedido({
+      req,
       mensagem: req.body?.mensagem,
       historico: req.body?.historico,
       arquivos: req.body?.arquivos,
@@ -1100,6 +1453,7 @@ app.post('/ia/gerar-imagem', async (req, res) => {
       textoSeguro(req.body?.prompt, 12000);
 
     const resultado = await processarPedido({
+      req,
       mensagem,
       historico: req.body?.historico,
       arquivos: req.body?.arquivos,
@@ -1143,6 +1497,48 @@ function responderErroHttp(res, erro, evento, inicio) {
   if (statusOriginal === 400 || statusOriginal === 413) {
     return res.status(statusOriginal).json({
       ok: false,
+      erro: textoSeguro(erro.message, 700),
+    });
+  }
+
+  if (
+    statusOriginal === 401 &&
+    (
+      erro?.codigo === 'SESSAO_NAO_IDENTIFICADA' ||
+      erro?.codigo === 'USUARIO_NAO_IDENTIFICADO'
+    )
+  ) {
+    return res.status(401).json({
+      ok: false,
+      codigo: erro.codigo,
+      erro: textoSeguro(erro.message, 700),
+    });
+  }
+
+  if (
+    statusOriginal === 403 &&
+    (
+      erro?.codigo === 'LIMITE_IMAGENS_IA_ATINGIDO' ||
+      erro?.codigo === 'CADASTRO_USUARIO_NAO_ENCONTRADO' ||
+      erro?.codigo === 'PLANO_NAO_IDENTIFICADO' ||
+      erro?.codigo === 'PLANO_NAO_ENCONTRADO'
+    )
+  ) {
+    return res.status(403).json({
+      ok: false,
+      codigo: erro.codigo,
+      erro: textoSeguro(erro.message, 700),
+      franquiaImagem: erro?.franquiaImagem || undefined,
+    });
+  }
+
+  if (
+    statusOriginal === 503 &&
+    erro?.codigo === 'CONTROLE_IMAGENS_INDISPONIVEL'
+  ) {
+    return res.status(503).json({
+      ok: false,
+      codigo: erro.codigo,
       erro: textoSeguro(erro.message, 700),
     });
   }
