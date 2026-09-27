@@ -12,6 +12,7 @@
  * Variáveis de ambiente esperadas no Render:
  *   GEMINI_API_KEY
  *   GEMINI_FALLBACK_MODEL
+ *   OPENAI_API_KEY (somente para o endpoint isolado de teste)
  *
  * O servidor mantém compatibilidade com:
  *   POST /ia/perguntar
@@ -52,6 +53,13 @@ const GEMINI_MAIN_MODEL = String(
 
 const GEMINI_IMAGE_MODEL = String(
   process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image'
+).trim();
+
+// OpenAI é usada somente pelo endpoint isolado de teste abaixo.
+// O fluxo normal da Jisa continua usando Gemini até validarmos qualidade/custo.
+const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
+const OPENAI_TEST_IMAGE_MODEL = String(
+  process.env.OPENAI_TEST_IMAGE_MODEL || 'gpt-image-1-mini'
 ).trim();
 
 const MAX_HISTORICO = 14;
@@ -801,6 +809,66 @@ async function gerarOuEditarImagemGemini({ promptVisual, imagens = [] }) {
 }
 
 // ----------------------------------------------------------------
+// OPENAI - TESTE ISOLADO DE IMAGEM LOW
+// ----------------------------------------------------------------
+
+async function gerarImagemOpenAITeste({ promptVisual }) {
+  if (!OPENAI_API_KEY) {
+    const erro = new Error('OPENAI_API_KEY não está configurada no Render.');
+    erro.statusCode = 503;
+    throw erro;
+  }
+
+  const prompt = limitarTextoPorCaracteres(
+    textoSeguro(promptVisual, 5000) ||
+      'Crie uma sala de estar moderna e fotorrealista, relacionada à construção civil.',
+    5000
+  );
+
+  logInfo('openai_teste_gerar_imagem', {
+    modelo: OPENAI_TEST_IMAGE_MODEL,
+    qualidade: 'low',
+    tamanho: '1024x1024',
+  });
+
+  const { data } = await fetchJson(
+    'https://api.openai.com/v1/images/generations',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: OPENAI_TEST_IMAGE_MODEL,
+        prompt,
+        size: '1024x1024',
+        quality: 'low',
+        output_format: 'jpeg',
+        output_compression: 85,
+        n: 1,
+      }),
+    },
+    TIMEOUT_IMAGEM_MS
+  );
+
+  const item = Array.isArray(data?.data) ? data.data[0] : null;
+  const imagemBase64 = String(item?.b64_json || '').trim();
+
+  if (!imagemBase64) {
+    throw new Error('A OpenAI não retornou uma imagem utilizável no teste.');
+  }
+
+  return {
+    imagemBase64,
+    mimeType: 'image/jpeg',
+    modelo: OPENAI_TEST_IMAGE_MODEL,
+    qualidade: data?.quality || 'low',
+    tamanho: data?.size || '1024x1024',
+  };
+}
+
+// ----------------------------------------------------------------
 // RESPOSTA TEXTUAL DA JISA
 // ----------------------------------------------------------------
 
@@ -985,8 +1053,49 @@ app.get('/health', (_req, res) => {
       modeloPrincipal: GEMINI_MAIN_MODEL,
       modeloFallback: GEMINI_FALLBACK_MODEL,
       modeloImagem: GEMINI_IMAGE_MODEL,
+      openaiTeste: Boolean(OPENAI_API_KEY),
+      modeloOpenAITeste: OPENAI_TEST_IMAGE_MODEL,
     },
   });
+});
+
+// ----------------------------------------------------------------
+// TESTE ISOLADO - OPENAI IMAGE LOW
+// Não altera o fluxo normal da Jisa.
+// ----------------------------------------------------------------
+
+app.post('/ia/teste-openai-imagem', async (req, res) => {
+  const inicio = Date.now();
+
+  try {
+    const prompt =
+      textoSeguro(req.body?.prompt, 5000) ||
+      textoSeguro(req.body?.mensagem, 5000) ||
+      'Crie uma sala de estar moderna, fotorrealista, com porcelanato, painel de madeira, sofá cinza e iluminação quente.';
+
+    const imagem = await gerarImagemOpenAITeste({ promptVisual: prompt });
+
+    logInfo('ia_teste_openai_imagem_ok', {
+      modelo: imagem.modelo,
+      qualidade: imagem.qualidade,
+      tamanho: imagem.tamanho,
+      duracaoMs: Date.now() - inicio,
+    });
+
+    return res.status(200).json({
+      ok: true,
+      tipo: 'imagem',
+      acao: 'teste_openai_imagem',
+      resposta: 'Imagem de teste criada pela OpenAI em qualidade Low.',
+      imagemBase64: imagem.imagemBase64,
+      mimeType: imagem.mimeType,
+      modelo: imagem.modelo,
+      qualidade: imagem.qualidade,
+      tamanho: imagem.tamanho,
+    });
+  } catch (erro) {
+    return responderErroHttp(res, erro, 'ia_teste_openai_imagem', inicio);
+  }
 });
 
 // ----------------------------------------------------------------
