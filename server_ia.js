@@ -4,22 +4,24 @@
  * server_ia.js
  * ================================================================
  *
- * Arquitetura:
- *   Flutter -> este servidor -> Gemini (cérebro/orquestrador)
- *                            -> Cloudflare FLUX (imagem nova)
- *                            -> Gemini Image (edição com referência)
+ * Arquitetura 100% OpenAI:
+ *   Flutter -> este servidor -> OpenAI Responses API
+ *                            -> GPT (texto, contexto, visão e decisão)
+ *                            -> GPT Image (geração e edição de imagens)
  *
- * Variáveis de ambiente esperadas no Render:
- *   GEMINI_API_KEY
- *   GEMINI_FALLBACK_MODEL
- *   OPENAI_API_KEY (somente para o endpoint isolado de teste)
+ * Variável obrigatória no Render:
+ *   OPENAI_API_KEY
  *
- * O servidor mantém compatibilidade com:
+ * Variáveis opcionais:
+ *   OPENAI_MAIN_MODEL
+ *   OPENAI_IMAGE_MODEL
+ *   OPENAI_IMAGE_QUALITY
+ *
+ * Endpoints mantidos para compatibilidade com o Flutter:
+ *   POST /ia/processar
  *   POST /ia/perguntar
  *   POST /ia/gerar-imagem
- *
- * E oferece o endpoint unificado recomendado:
- *   POST /ia/processar
+ *   GET  /health
  *
  * A Jisa é especializada exclusivamente em construção civil,
  * com saudações, agradecimentos e despedidas sempre permitidos.
@@ -42,31 +44,28 @@ app.use(express.urlencoded({ extended: true, limit: '30mb' }));
 
 const PORT = Number(process.env.PORT || 10000);
 
-const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
-const GEMINI_FALLBACK_MODEL = String(
-  process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.8-flash'
-).trim();
-
-const GEMINI_MAIN_MODEL = String(
-  process.env.GEMINI_MAIN_MODEL || 'gemini-3.5-flash-lite'
-).trim();
-
-const GEMINI_IMAGE_MODEL = String(
-  process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image'
-).trim();
-
-// OpenAI é usada somente pelo endpoint isolado de teste abaixo.
-// O fluxo normal da Jisa continua usando Gemini até validarmos qualidade/custo.
 const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
-const OPENAI_TEST_IMAGE_MODEL = String(
-  process.env.OPENAI_TEST_IMAGE_MODEL || 'gpt-image-1-mini'
+
+// Modelo principal: conversa, contexto, visão, análise e orquestração.
+const OPENAI_MAIN_MODEL = String(
+  process.env.OPENAI_MAIN_MODEL || 'gpt-5.6-luna'
 ).trim();
+
+// Modelo visual. Sunburst prioriza fidelidade de edição/continuidade.
+const OPENAI_IMAGE_MODEL = String(
+  process.env.OPENAI_IMAGE_MODEL || 'gpt-image-2.5-sunburst'
+).trim();
+
+// Começamos em LOW para controlar custo. Pode ser alterado no Render.
+const OPENAI_IMAGE_QUALITY = String(
+  process.env.OPENAI_IMAGE_QUALITY || 'low'
+).trim().toLowerCase();
 
 const MAX_HISTORICO = 14;
 const MAX_ARQUIVOS = 5;
 const MAX_ARQUIVO_BYTES = 18 * 1024 * 1024;
-const TIMEOUT_GEMINI_MS = 65000;
-const TIMEOUT_IMAGEM_MS = 100000;
+const TIMEOUT_OPENAI_MS = 90000;
+const TIMEOUT_IMAGEM_MS = 180000;
 
 const RESPOSTA_FORA_ESCOPO =
   'Posso ajudar com assuntos relacionados à construção civil. ' +
@@ -133,20 +132,56 @@ IMAGENS
   de maquete, miniatura, diorama ou brinquedo, salvo se isso for pedido.
 `.trim();
 
+const INSTRUCAO_ORQUESTRADOR = `
+Você é o cérebro/orquestrador da Jisa, assistente do Ache Obra.
+
+A Jisa é especialista EXCLUSIVAMENTE em construção civil.
+Interprete semanticamente o pedido atual junto com o histórico. Não dependa de
+listas rígidas de palavras-chave.
+
+Saudações, agradecimentos, despedidas e conversa social curta são permitidos.
+
+Classifique o pedido atual em UMA ação:
+- "texto": conversa, pergunta, análise, cálculo, orientação ou análise de anexos.
+- "imagem": criação de uma NOVA imagem relacionada à construção civil.
+- "editar_imagem": alteração visual de uma imagem enviada agora ou continuação/
+  modificação da última imagem gerada, quando ela estiver disponível.
+- "fora_escopo": pedido claramente fora da construção civil, exceto interação social.
+
+REGRAS:
+- Uma imagem pode conter elementos secundários fora da construção se o assunto
+  principal continuar sendo construção.
+- Se o usuário enviou imagem apenas para analisar, use "texto".
+- Se pediu para modificar visualmente uma imagem, use "editar_imagem".
+- Se existe imagem anterior disponível e o pedido continua aquela criação
+  ("troque o piso", "coloque garagem", "mais realista", "mude a janela",
+  "agora mostre por dentro"), prefira "editar_imagem".
+- Use "imagem" quando a criação for nova e independente.
+- Para "imagem" e "editar_imagem", produza promptVisual em português, compacto,
+  autocontido e fiel ao histórico.
+- Em edição, diga explicitamente o que deve ser preservado e o que deve mudar.
+- Para texto/fora_escopo, promptVisual deve ser vazio.
+
+Responda SOMENTE JSON válido, sem Markdown:
+{
+  "acao": "texto|imagem|editar_imagem|fora_escopo",
+  "promptVisual": "",
+  "motivoCurto": ""
+}
+`.trim();
+
 // ----------------------------------------------------------------
-// UTILITÁRIOS GERAIS
+// UTILITÁRIOS
 // ----------------------------------------------------------------
 
 function logInfo(evento, dados = {}) {
   try {
-    console.log(
-      JSON.stringify({
-        nivel: 'INFO',
-        evento,
-        ...dados,
-        horario: new Date().toISOString(),
-      })
-    );
+    console.log(JSON.stringify({
+      nivel: 'INFO',
+      evento,
+      ...dados,
+      horario: new Date().toISOString(),
+    }));
   } catch (_) {
     console.log(`[INFO] ${evento}`);
   }
@@ -157,15 +192,13 @@ function logErro(evento, erro, dados = {}) {
     erro instanceof Error ? erro.message : String(erro || 'Erro desconhecido');
 
   try {
-    console.error(
-      JSON.stringify({
-        nivel: 'ERRO',
-        evento,
-        mensagem,
-        ...dados,
-        horario: new Date().toISOString(),
-      })
-    );
+    console.error(JSON.stringify({
+      nivel: 'ERRO',
+      evento,
+      mensagem,
+      ...dados,
+      horario: new Date().toISOString(),
+    }));
   } catch (_) {
     console.error(`[ERRO] ${evento}: ${mensagem}`);
   }
@@ -174,18 +207,14 @@ function logErro(evento, erro, dados = {}) {
 function textoSeguro(valor, limite = 12000) {
   if (valor === null || valor === undefined) return '';
   const texto = String(valor).trim();
-  if (texto.length <= limite) return texto;
-  return texto.slice(0, limite);
+  return texto.length <= limite ? texto : texto.slice(0, limite);
 }
 
 function limitarTextoPorCaracteres(texto, limite) {
   const valor = String(texto || '').trim();
-  if (valor.length <= limite) return valor;
-  return valor.slice(0, limite).trim();
+  return valor.length <= limite ? valor : valor.slice(0, limite).trim();
 }
 
-// Remove artefatos de formatação que eventualmente podem vir na resposta
-// textual do modelo, como o marcador literal "$1" antes de itens de lista.
 function limparArtefatosResposta(texto) {
   return String(texto || '')
     .replace(/(^|\n)(\s*(?:[-*•]|\d+[.)])?\s*)\$1(?=\s)/g, '$1$2')
@@ -232,14 +261,10 @@ function mimeEhImagem(mimeType) {
 
 function normalizarMime(mimeType, nome = '') {
   let mime = String(mimeType || '').trim().toLowerCase();
-
   if (mime === 'image/jpg') mime = 'image/jpeg';
   if (mime) return mime;
 
-  const extensao = String(nome || '')
-    .toLowerCase()
-    .split('.')
-    .pop();
+  const extensao = String(nome || '').toLowerCase().split('.').pop();
 
   const mapa = {
     jpg: 'image/jpeg',
@@ -255,14 +280,11 @@ function normalizarMime(mimeType, nome = '') {
     xml: 'text/xml',
     json: 'application/json',
     doc: 'application/msword',
-    docx:
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     xls: 'application/vnd.ms-excel',
-    xlsx:
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     ppt: 'application/vnd.ms-powerpoint',
-    pptx:
-      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     odt: 'application/vnd.oasis.opendocument.text',
     ods: 'application/vnd.oasis.opendocument.spreadsheet',
     odp: 'application/vnd.oasis.opendocument.presentation',
@@ -347,7 +369,7 @@ function normalizarHistorico(historico) {
       const roleOriginal = String(item?.role || '').toLowerCase();
       const role =
         roleOriginal === 'assistant' || roleOriginal === 'model'
-          ? 'model'
+          ? 'assistant'
           : 'user';
 
       return {
@@ -363,7 +385,7 @@ function historicoEmTexto(historico, limite = 10) {
   return normalizarHistorico(historico)
     .slice(-limite)
     .map((item) => {
-      const papel = item.role === 'model' ? 'Jisa' : 'Usuário';
+      const papel = item.role === 'assistant' ? 'Jisa' : 'Usuário';
       const imagem = item.teveImagemGerada ? ' [imagem gerada]' : '';
       return `${papel}${imagem}: ${item.content}`;
     })
@@ -374,6 +396,10 @@ function possuiReferenciaVisualNoHistorico(historico) {
   return normalizarHistorico(historico).some(
     (item) => item.teveImagemGerada === true
   );
+}
+
+function dataUrlArquivo(arquivo) {
+  return `data:${arquivo.mimeType};base64,${arquivo.base64}`;
 }
 
 function withTimeout(ms) {
@@ -413,7 +439,7 @@ async function fetchJson(url, opcoes = {}, timeoutMs = 60000) {
             JSON.stringify(dados || {});
 
       const erro = new Error(
-        `HTTP ${resposta.status}: ${limitarTextoPorCaracteres(detalhe, 1000)}`
+        `HTTP ${resposta.status}: ${limitarTextoPorCaracteres(detalhe, 1400)}`
       );
       erro.statusCode = resposta.status;
       erro.responseData = dados;
@@ -430,213 +456,152 @@ async function fetchJson(url, opcoes = {}, timeoutMs = 60000) {
   }
 }
 
-// ----------------------------------------------------------------
-// GEMINI - TEXTO / CÉREBRO
-// ----------------------------------------------------------------
+function headersOpenAI() {
+  if (!OPENAI_API_KEY) {
+    const erro = new Error('OPENAI_API_KEY não está configurada no Render.');
+    erro.statusCode = 503;
+    throw erro;
+  }
 
-function urlGemini(modelo) {
-  return (
-    'https://generativelanguage.googleapis.com/v1beta/models/' +
-    encodeURIComponent(modelo) +
-    ':generateContent?key=' +
-    encodeURIComponent(GEMINI_API_KEY)
-  );
+  return {
+    Authorization: `Bearer ${OPENAI_API_KEY}`,
+    'Content-Type': 'application/json',
+  };
 }
 
-function montarConteudosGemini({
-  mensagem,
-  historico,
-  arquivos = [],
-  instrucaoExtra = '',
-}) {
-  const conteudos = [];
+// ----------------------------------------------------------------
+// OPENAI RESPONSES API - TEXTO / VISÃO / ORQUESTRAÇÃO
+// ----------------------------------------------------------------
 
-  for (const item of normalizarHistorico(historico)) {
-    conteudos.push({
-      role: item.role,
-      parts: [{ text: item.content }],
-    });
+function extrairTextoOpenAI(dados) {
+  if (typeof dados?.output_text === 'string' && dados.output_text.trim()) {
+    return dados.output_text.trim();
   }
 
-  const partesAtuais = [];
+  const saidas = Array.isArray(dados?.output) ? dados.output : [];
+  const textos = [];
 
-  const textoAtual =
-    textoSeguro(mensagem, 12000) ||
-    (arquivos.length > 0 ? 'Analise os arquivos enviados.' : '');
+  for (const item of saidas) {
+    if (item?.type !== 'message' || !Array.isArray(item?.content)) continue;
 
-  if (textoAtual) {
-    partesAtuais.push({
-      text: instrucaoExtra
-        ? `${instrucaoExtra}\n\nPEDIDO ATUAL DO USUÁRIO:\n${textoAtual}`
-        : textoAtual,
-    });
-  }
-
-  for (const arquivo of arquivos) {
-    partesAtuais.push({
-      inlineData: {
-        mimeType: arquivo.mimeType,
-        data: arquivo.base64,
-      },
-    });
-  }
-
-  if (partesAtuais.length > 0) {
-    conteudos.push({
-      role: 'user',
-      parts: partesAtuais,
-    });
-  }
-
-  return conteudos;
-}
-
-function extrairTextoGemini(dados) {
-  const candidatos = Array.isArray(dados?.candidates) ? dados.candidates : [];
-
-  for (const candidato of candidatos) {
-    const partes = candidato?.content?.parts;
-
-    if (!Array.isArray(partes)) continue;
-
-    const textos = partes
-      .map((parte) => (typeof parte?.text === 'string' ? parte.text : ''))
-      .filter(Boolean);
-
-    if (textos.length > 0) {
-      return textos.join('\n').trim();
+    for (const parte of item.content) {
+      if (
+        (parte?.type === 'output_text' || parte?.type === 'text') &&
+        typeof parte?.text === 'string'
+      ) {
+        textos.push(parte.text);
+      }
     }
   }
 
-  return '';
+  return textos.join('\n').trim();
 }
 
-async function chamarGeminiComModelo({
-  modelo,
+function montarInputOpenAI({
+  mensagem,
+  historico = [],
+  arquivos = [],
+  instrucaoExtra = '',
+}) {
+  const input = [];
+
+  for (const item of normalizarHistorico(historico)) {
+    input.push({
+      role: item.role,
+      content: item.content,
+    });
+  }
+
+  const conteudoAtual = [];
+  const textoAtual =
+    textoSeguro(mensagem, 12000) ||
+    (arquivos.length > 0 ? 'Analise os arquivos enviados.' : 'Olá');
+
+  conteudoAtual.push({
+    type: 'input_text',
+    text: instrucaoExtra
+      ? `${instrucaoExtra}\n\nPEDIDO ATUAL DO USUÁRIO:\n${textoAtual}`
+      : textoAtual,
+  });
+
+  for (const arquivo of arquivos) {
+    if (arquivo.ehImagem) {
+      conteudoAtual.push({
+        type: 'input_image',
+        image_url: dataUrlArquivo(arquivo),
+      });
+    } else {
+      // Documentos são enviados como data URL pelo input_file.
+      conteudoAtual.push({
+        type: 'input_file',
+        filename: arquivo.nome,
+        file_data: dataUrlArquivo(arquivo),
+      });
+    }
+  }
+
+  input.push({
+    role: 'user',
+    content: conteudoAtual,
+  });
+
+  return input;
+}
+
+async function chamarOpenAITexto({
   mensagem,
   historico = [],
   arquivos = [],
   systemInstruction = INSTRUCAO_SISTEMA,
   instrucaoExtra = '',
-  temperature = 0.35,
   maxOutputTokens = 1800,
+  reasoningEffort = 'low',
 }) {
-  if (!GEMINI_API_KEY) {
-    const erro = new Error('GEMINI_API_KEY não está configurada no Render.');
-    erro.statusCode = 503;
-    throw erro;
-  }
-
   const corpo = {
-    systemInstruction: {
-      parts: [{ text: systemInstruction }],
-    },
-    contents: montarConteudosGemini({
+    model: OPENAI_MAIN_MODEL,
+    instructions: systemInstruction,
+    input: montarInputOpenAI({
       mensagem,
       historico,
       arquivos,
       instrucaoExtra,
     }),
-    generationConfig: {
-      temperature,
-      maxOutputTokens,
+    max_output_tokens: maxOutputTokens,
+    reasoning: {
+      effort: reasoningEffort,
     },
   };
 
+  logInfo('openai_texto', {
+    modelo: OPENAI_MAIN_MODEL,
+    arquivos: arquivos.length,
+  });
+
   const { data } = await fetchJson(
-    urlGemini(modelo),
+    'https://api.openai.com/v1/responses',
     {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: headersOpenAI(),
       body: JSON.stringify(corpo),
     },
-    TIMEOUT_GEMINI_MS
+    TIMEOUT_OPENAI_MS
   );
 
-  const texto = extrairTextoGemini(data);
+  const texto = extrairTextoOpenAI(data);
 
   if (!texto) {
-    const motivo =
-      data?.candidates?.[0]?.finishReason ||
-      data?.promptFeedback?.blockReason ||
-      'sem conteúdo';
-
-    throw new Error(`O Gemini não retornou texto utilizável (${motivo}).`);
+    throw new Error('A OpenAI não retornou texto utilizável.');
   }
 
-  return texto;
-}
-
-async function chamarGeminiTexto(opcoes) {
-  try {
-    return await chamarGeminiComModelo({
-      ...opcoes,
-      modelo: GEMINI_MAIN_MODEL,
-    });
-  } catch (erroPrincipal) {
-    logErro('gemini_modelo_principal_falhou', erroPrincipal, {
-      modelo: GEMINI_MAIN_MODEL,
-    });
-
-    if (
-      !GEMINI_FALLBACK_MODEL ||
-      GEMINI_FALLBACK_MODEL === GEMINI_MAIN_MODEL
-    ) {
-      throw erroPrincipal;
-    }
-
-    return chamarGeminiComModelo({
-      ...opcoes,
-      modelo: GEMINI_FALLBACK_MODEL,
-    });
-  }
+  return {
+    texto,
+    responseId: textoSeguro(data?.id, 300),
+  };
 }
 
 // ----------------------------------------------------------------
-// GEMINI - ORQUESTRADOR
+// OPENAI - DECISÃO SEMÂNTICA DA JISA
 // ----------------------------------------------------------------
-
-const INSTRUCAO_ORQUESTRADOR = `
-Você é o cérebro/orquestrador da Jisa, assistente do Ache Obra.
-
-A Jisa é especialista EXCLUSIVAMENTE em construção civil.
-Interprete semanticamente o pedido e o contexto. Não use correspondência literal
-de palavras como critério principal.
-
-Saudações, agradecimentos, despedidas e conversa social curta são permitidos.
-
-Classifique o pedido atual em UMA ação:
-- "texto": pergunta, conversa, análise, cálculo, orientação ou análise de anexos.
-- "imagem": criar/gerar uma NOVA imagem visual relacionada à construção civil.
-- "editar_imagem": modificar a imagem enviada agora OU continuar/modificar a última imagem gerada pela Jisa quando ela estiver disponível como memória visual.
-- "fora_escopo": pedido claramente fora de construção civil, exceto interação social.
-
-REGRAS IMPORTANTES:
-- "crie uma casa com um cachorro no quintal" é construção e pode ser "imagem".
-- "crie um dragão" é "fora_escopo".
-- Se o usuário enviou uma imagem apenas para analisar, a ação é "texto".
-- Se enviou uma imagem e pediu para alterar visualmente, é "editar_imagem".
-- Se existe última imagem gerada disponível e o pedido continua aquela imagem (ex.: "coloque uma garagem", "troque o telhado", "mais realista", "agora por dentro"), use "editar_imagem".
-- Só use "imagem" com uma imagem anterior disponível quando o usuário estiver pedindo claramente uma criação nova e independente.
-- Use o histórico para compreender "ela", "essa casa", "a anterior",
-  "mais realista", "agora coloque garagem", "mostre por dentro" etc.
-- Não invente intenção visual se o usuário só pediu explicação textual.
-- Para "imagem", crie também um promptVisual compacto, completo e autocontido.
-- Para "editar_imagem", crie um promptVisual objetivo dizendo o que preservar
-  e o que modificar.
-- O promptVisual deve estar em português, ter no máximo 1500 caracteres e
-  preservar os requisitos relevantes já definidos.
-- Se a ação for "texto" ou "fora_escopo", promptVisual deve ser "".
-
-Responda SOMENTE JSON válido, sem Markdown:
-{
-  "acao": "texto|imagem|editar_imagem|fora_escopo",
-  "promptVisual": "",
-  "motivoCurto": ""
-}
-`.trim();
 
 async function decidirAcaoJisa({
   mensagem,
@@ -647,7 +612,6 @@ async function decidirAcaoJisa({
 }) {
   const imagens = arquivos.filter((arquivo) => arquivo.ehImagem);
   const documentos = arquivos.filter((arquivo) => !arquivo.ehImagem);
-
   const contexto = historicoEmTexto(historico, 10);
   const temImagemAnterior = possuiReferenciaVisualNoHistorico(historico);
 
@@ -661,34 +625,28 @@ ${contexto || '(sem histórico)'}
 ANEXOS:
 - imagens enviadas agora: ${imagens.length}
 - documentos enviados agora: ${documentos.length}
-- existe indicação de imagem gerada anteriormente no histórico: ${
-    temImagemAnterior ? 'sim' : 'não'
-  }
-- a última imagem gerada está disponível em bytes para edição: ${
-    temImagemAnteriorDisponivel ? 'sim' : 'não'
-  }
+- existe indicação de imagem gerada anteriormente: ${temImagemAnterior ? 'sim' : 'não'}
+- última imagem em bytes disponível para edição: ${temImagemAnteriorDisponivel ? 'sim' : 'não'}
 
 COMPATIBILIDADE:
-- endpoint visual solicitado explicitamente pelo aplicativo: ${
-    forcarImagem ? 'sim' : 'não'
-  }
+- endpoint visual solicitado explicitamente pelo aplicativo: ${forcarImagem ? 'sim' : 'não'}
 
-Mesmo quando o endpoint visual foi solicitado, respeite o escopo da construção civil.
+Mesmo no endpoint visual, respeite o escopo da construção civil.
 `.trim();
 
-  const resposta = await chamarGeminiTexto({
+  const resposta = await chamarOpenAITexto({
     mensagem: resumo,
     historico: [],
     arquivos: [],
     systemInstruction: INSTRUCAO_ORQUESTRADOR,
-    temperature: 0.1,
-    maxOutputTokens: 500,
+    maxOutputTokens: 700,
+    reasoningEffort: 'low',
   });
 
-  const json = extrairJsonObjeto(resposta);
+  const json = extrairJsonObjeto(resposta.texto);
 
   if (!json) {
-    throw new Error('O Gemini não retornou uma decisão de ação válida.');
+    throw new Error('A OpenAI não retornou uma decisão de ação válida.');
   }
 
   const acoes = new Set([
@@ -698,46 +656,34 @@ Mesmo quando o endpoint visual foi solicitado, respeite o escopo da construção
     'fora_escopo',
   ]);
 
-  let acao = String(json.acao || '').trim().toLowerCase();
+  const acao = String(json.acao || '').trim().toLowerCase();
 
   if (!acoes.has(acao)) {
-    throw new Error(`Ação inválida retornada pelo Gemini: ${acao || '(vazia)'}`);
-  }
-
-  if (acao === 'imagem' && documentos.length > 0 && imagens.length === 0) {
-    // O orquestrador pode interpretar um documento como base para imagem, mas o
-    // endpoint visual do FLUX não lê documentos. Mantemos o cérebro no Gemini:
-    // o documento será analisado em texto e a Jisa poderá orientar o usuário.
-    acao = 'texto';
+    throw new Error(`Ação inválida retornada pela OpenAI: ${acao || '(vazia)'}`);
   }
 
   return {
     acao,
-    promptVisual: limitarTextoPorCaracteres(json.promptVisual || '', 1500),
+    promptVisual: limitarTextoPorCaracteres(json.promptVisual || '', 3000),
     motivoCurto: limitarTextoPorCaracteres(json.motivoCurto || '', 300),
   };
 }
 
 // ----------------------------------------------------------------
-// GEMINI IMAGE - GERAÇÃO E EDIÇÃO DE IMAGENS
+// OPENAI RESPONSES API - GERAÇÃO / EDIÇÃO DE IMAGEM
 // ----------------------------------------------------------------
 
+function extrairImagemOpenAI(dados) {
+  const saidas = Array.isArray(dados?.output) ? dados.output : [];
 
-function extrairImagemGemini(dados) {
-  const candidatos = Array.isArray(dados?.candidates) ? dados.candidates : [];
-
-  for (const candidato of candidatos) {
-    const partes = candidato?.content?.parts;
-
-    if (!Array.isArray(partes)) continue;
-
-    for (const parte of partes) {
-      const inline = parte?.inlineData || parte?.inline_data;
-
-      if (inline?.data) {
+  for (const item of saidas) {
+    if (item?.type === 'image_generation_call') {
+      const base64 = String(item?.result || '').trim();
+      if (base64) {
         return {
-          imagemBase64: inline.data,
-          mimeType: inline.mimeType || inline.mime_type || 'image/png',
+          imagemBase64: base64,
+          mimeType: 'image/png',
+          imageCallId: textoSeguro(item?.id, 300),
         };
       }
     }
@@ -746,130 +692,127 @@ function extrairImagemGemini(dados) {
   return null;
 }
 
-async function gerarOuEditarImagemGemini({ promptVisual, imagens = [] }) {
-  if (!GEMINI_API_KEY) {
-    const erro = new Error('GEMINI_API_KEY não está configurada no Render.');
-    erro.statusCode = 503;
-    throw erro;
-  }
+function montarInputVisual({
+  promptVisual,
+  imagens = [],
+  historico = [],
+  editando = false,
+}) {
+  const contexto = historicoEmTexto(historico, 10);
 
-  const referencias = Array.isArray(imagens) ? imagens.slice(0, 3) : [];
-  const editando = referencias.length > 0;
+  const instrucao = editando
+    ? `Edite a imagem de referência conforme o pedido. Preserve rigorosamente tudo
+que não foi solicitado para mudar: identidade do ambiente/construção, geometria,
+composição, enquadramento, materiais, proporções, aberturas, iluminação e objetos.
+Faça somente as alterações pedidas, salvo adaptação fisicamente indispensável.`
+    : `Crie uma imagem nova relacionada à construção civil. Respeite integralmente
+o pedido e as proporções plausíveis. Quando o pedido exigir realismo, produza
+fotografia arquitetônica fotorrealista, em escala real, com materiais reais e
+iluminação natural, evitando aparência de maquete ou brinquedo.`;
 
-  const partes = [
-    {
-      text: editando
-        ? 'Edite a imagem de referência conforme o pedido abaixo. Preserve a identidade visual da construção, composição, materiais, proporções, fachada, telhado, aberturas e demais elementos que não foram solicitados para mudar. Faça somente as alterações pedidas, salvo quando uma adaptação for indispensável para coerência física. O resultado deve permanecer coerente com construção civil.\n\n' + limitarTextoPorCaracteres(promptVisual, 3000)
-        : 'Crie uma imagem nova conforme o pedido abaixo. O resultado deve ser coerente com construção civil, com proporções plausíveis e respeitando todos os requisitos descritos. Quando o pedido exigir realismo, use aparência fotográfica arquitetônica realista, materiais reais, escala real e iluminação natural, sem aparência de maquete.\n\n' + limitarTextoPorCaracteres(promptVisual, 3000),
-    },
-  ];
+  const texto = [
+    instrucao,
+    contexto ? `CONTEXTO RECENTE:\n${contexto}` : '',
+    `PEDIDO VISUAL:\n${limitarTextoPorCaracteres(promptVisual, 4000)}`,
+  ].filter(Boolean).join('\n\n');
 
-  for (const imagem of referencias) {
-    partes.push({
-      inlineData: {
-        mimeType: imagem.mimeType,
-        data: imagem.base64,
-      },
+  const content = [{
+    type: 'input_text',
+    text: texto,
+  }];
+
+  for (const imagem of imagens.slice(0, 3)) {
+    content.push({
+      type: 'input_image',
+      image_url: dataUrlArquivo(imagem),
     });
   }
 
+  return [{
+    role: 'user',
+    content,
+  }];
+}
+
+async function gerarOuEditarImagemOpenAI({
+  promptVisual,
+  imagens = [],
+  historico = [],
+  previousResponseId = '',
+}) {
+  const referencias = Array.isArray(imagens) ? imagens.slice(0, 3) : [];
+  const editando = referencias.length > 0;
+
   const corpo = {
-    contents: [{ role: 'user', parts: partes }],
-    generationConfig: {
-      responseModalities: ['TEXT', 'IMAGE'],
+    model: OPENAI_MAIN_MODEL,
+    instructions: INSTRUCAO_SISTEMA,
+    input: montarInputVisual({
+      promptVisual,
+      imagens: referencias,
+      historico,
+      editando,
+    }),
+    tools: [{
+      type: 'image_generation',
+      model: OPENAI_IMAGE_MODEL,
+      quality: OPENAI_IMAGE_QUALITY,
+      size: '1024x1024',
+      action: editando ? 'edit' : 'generate',
+    }],
+    tool_choice: {
+      type: 'image_generation',
+    },
+    reasoning: {
+      effort: 'low',
     },
   };
 
-  logInfo(editando ? 'gemini_editar_imagem' : 'gemini_gerar_imagem', {
-    modelo: GEMINI_IMAGE_MODEL,
+  // previous_response_id melhora continuidade quando o Flutter passar esse campo.
+  // A imagem em bytes continua sendo aceita como fallback e para compatibilidade.
+  if (previousResponseId) {
+    corpo.previous_response_id = previousResponseId;
+  }
+
+  logInfo(editando ? 'openai_editar_imagem' : 'openai_gerar_imagem', {
+    modeloPrincipal: OPENAI_MAIN_MODEL,
+    modeloImagem: OPENAI_IMAGE_MODEL,
+    qualidade: OPENAI_IMAGE_QUALITY,
     referencias: referencias.length,
+    temPreviousResponseId: Boolean(previousResponseId),
   });
 
   const { data } = await fetchJson(
-    urlGemini(GEMINI_IMAGE_MODEL),
+    'https://api.openai.com/v1/responses',
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: headersOpenAI(),
       body: JSON.stringify(corpo),
     },
     TIMEOUT_IMAGEM_MS
   );
 
-  const imagem = extrairImagemGemini(data);
+  const imagem = extrairImagemOpenAI(data);
 
   if (!imagem) {
-    const motivo =
-      data?.candidates?.[0]?.finishReason ||
-      data?.promptFeedback?.blockReason ||
-      'sem imagem';
-    throw new Error(`O Gemini não retornou uma imagem (${motivo}).`);
-  }
-
-  return imagem;
-}
-
-// ----------------------------------------------------------------
-// OPENAI - TESTE ISOLADO DE IMAGEM LOW
-// ----------------------------------------------------------------
-
-async function gerarImagemOpenAITeste({ promptVisual }) {
-  if (!OPENAI_API_KEY) {
-    const erro = new Error('OPENAI_API_KEY não está configurada no Render.');
-    erro.statusCode = 503;
-    throw erro;
-  }
-
-  const prompt = limitarTextoPorCaracteres(
-    textoSeguro(promptVisual, 5000) ||
-      'Crie uma sala de estar moderna e fotorrealista, relacionada à construção civil.',
-    5000
-  );
-
-  logInfo('openai_teste_gerar_imagem', {
-    modelo: OPENAI_TEST_IMAGE_MODEL,
-    qualidade: 'low',
-    tamanho: '1024x1024',
-  });
-
-  const { data } = await fetchJson(
-    'https://api.openai.com/v1/images/generations',
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: OPENAI_TEST_IMAGE_MODEL,
-        prompt,
-        size: '1024x1024',
-        quality: 'low',
-        output_format: 'jpeg',
-        output_compression: 85,
-        n: 1,
-      }),
-    },
-    TIMEOUT_IMAGEM_MS
-  );
-
-  const item = Array.isArray(data?.data) ? data.data[0] : null;
-  const imagemBase64 = String(item?.b64_json || '').trim();
-
-  if (!imagemBase64) {
-    throw new Error('A OpenAI não retornou uma imagem utilizável no teste.');
+    const texto = extrairTextoOpenAI(data);
+    throw new Error(
+      texto
+        ? `A OpenAI não gerou a imagem. Resposta: ${limitarTextoPorCaracteres(texto, 500)}`
+        : 'A OpenAI não retornou uma imagem utilizável.'
+    );
   }
 
   return {
-    imagemBase64,
-    mimeType: 'image/jpeg',
-    modelo: OPENAI_TEST_IMAGE_MODEL,
-    qualidade: data?.quality || 'low',
-    tamanho: data?.size || '1024x1024',
+    ...imagem,
+    responseId: textoSeguro(data?.id, 300),
+    modelo: OPENAI_IMAGE_MODEL,
+    qualidade: OPENAI_IMAGE_QUALITY,
+    tamanho: '1024x1024',
   };
 }
 
 // ----------------------------------------------------------------
-// RESPOSTA TEXTUAL DA JISA
+// RESPOSTA TEXTUAL DA JISA - 100% OPENAI
 // ----------------------------------------------------------------
 
 async function responderTextoJisa({
@@ -877,18 +820,21 @@ async function responderTextoJisa({
   historico = [],
   arquivos = [],
 }) {
-  const resposta = await chamarGeminiTexto({
+  const resposta = await chamarOpenAITexto({
     mensagem:
       textoSeguro(mensagem, 12000) ||
       (arquivos.length ? 'Analise os arquivos enviados.' : 'Olá'),
     historico,
     arquivos,
     systemInstruction: INSTRUCAO_SISTEMA,
-    temperature: 0.35,
-    maxOutputTokens: 1800,
+    maxOutputTokens: 2200,
+    reasoningEffort: 'low',
   });
 
-  return limparArtefatosResposta(resposta);
+  return {
+    texto: limparArtefatosResposta(resposta.texto),
+    responseId: resposta.responseId,
+  };
 }
 
 // ----------------------------------------------------------------
@@ -900,6 +846,7 @@ async function processarPedido({
   historico,
   arquivos,
   imagemAnterior,
+  previousResponseId,
   forcarFluxoVisual = false,
 }) {
   const mensagemLimpa = textoSeguro(mensagem, 12000);
@@ -908,6 +855,8 @@ async function processarPedido({
   const imagemAnteriorLimpa = imagemAnterior
     ? validarArquivos([imagemAnterior])[0]
     : null;
+
+  const previousResponseIdLimpo = textoSeguro(previousResponseId, 300);
 
   if (imagemAnteriorLimpa && !imagemAnteriorLimpa.ehImagem) {
     const erro = new Error('A memória visual anterior precisa ser uma imagem.');
@@ -930,6 +879,7 @@ async function processarPedido({
   });
 
   logInfo('jisa_decisao', {
+    provedor: 'OpenAI',
     acao: decisao.acao,
     arquivos: arquivosLimpos.length,
     imagens: arquivosLimpos.filter((a) => a.ehImagem).length,
@@ -955,7 +905,8 @@ async function processarPedido({
       ok: true,
       tipo: 'texto',
       acao: 'texto',
-      resposta,
+      resposta: resposta.texto,
+      responseId: resposta.responseId,
     };
   }
 
@@ -967,18 +918,24 @@ async function processarPedido({
         ? [imagemAnteriorLimpa]
         : [];
 
-    if (imagens.length === 0) {
-      const erro = new Error('Não encontrei a imagem anterior para continuar a edição.');
+    // Se temos previous_response_id, a OpenAI pode continuar a imagem do turno
+    // anterior mesmo sem bytes. Se não temos nenhum dos dois, não há referência.
+    if (imagens.length === 0 && !previousResponseIdLimpo) {
+      const erro = new Error(
+        'Não encontrei a imagem anterior para continuar a edição.'
+      );
       erro.statusCode = 400;
       throw erro;
     }
 
-    const imagem = await gerarOuEditarImagemGemini({
+    const imagem = await gerarOuEditarImagemOpenAI({
       promptVisual:
         decisao.promptVisual ||
         mensagemLimpa ||
         'Edite a imagem conforme o contexto da conversa.',
       imagens,
+      historico: historicoLimpo,
+      previousResponseId: previousResponseIdLimpo,
     });
 
     return {
@@ -988,16 +945,22 @@ async function processarPedido({
       resposta: 'Imagem atualizada pela Jisa.',
       imagemBase64: imagem.imagemBase64,
       mimeType: imagem.mimeType,
+      responseId: imagem.responseId,
+      modeloImagem: imagem.modelo,
+      qualidade: imagem.qualidade,
+      tamanho: imagem.tamanho,
     };
   }
 
   const promptVisual =
     decisao.promptVisual ||
-    limitarTextoPorCaracteres(mensagemLimpa, 1500);
+    limitarTextoPorCaracteres(mensagemLimpa, 3000);
 
-  const imagem = await gerarOuEditarImagemGemini({
+  const imagem = await gerarOuEditarImagemOpenAI({
     promptVisual,
     imagens: [],
+    historico: historicoLimpo,
+    previousResponseId: '',
   });
 
   return {
@@ -1007,11 +970,15 @@ async function processarPedido({
     resposta: 'Imagem criada pela Jisa.',
     imagemBase64: imagem.imagemBase64,
     mimeType: imagem.mimeType,
+    responseId: imagem.responseId,
+    modeloImagem: imagem.modelo,
+    qualidade: imagem.qualidade,
+    tamanho: imagem.tamanho,
   };
 }
 
 // ----------------------------------------------------------------
-// CORS / ROTAS BÁSICAS
+// CORS / ROTAS
 // ----------------------------------------------------------------
 
 app.use((req, res, next) => {
@@ -1038,6 +1005,7 @@ app.get('/', (_req, res) => {
     servico: 'Ache Obra - Jisa IA',
     especialidade: 'Construção civil',
     status: 'online',
+    provedorIA: 'OpenAI',
   });
 });
 
@@ -1046,56 +1014,16 @@ app.get('/health', (_req, res) => {
     ok: true,
     servico: 'acheobra-ai-backend',
     jisa: 'online',
-    cerebro: 'Gemini',
-    geradorImagem: 'Gemini',
+    cerebro: 'OpenAI',
+    geradorImagem: 'OpenAI',
     configuracao: {
-      gemini: Boolean(GEMINI_API_KEY),
-      modeloPrincipal: GEMINI_MAIN_MODEL,
-      modeloFallback: GEMINI_FALLBACK_MODEL,
-      modeloImagem: GEMINI_IMAGE_MODEL,
-      openaiTeste: Boolean(OPENAI_API_KEY),
-      modeloOpenAITeste: OPENAI_TEST_IMAGE_MODEL,
+      openai: Boolean(OPENAI_API_KEY),
+      modeloPrincipal: OPENAI_MAIN_MODEL,
+      modeloImagem: OPENAI_IMAGE_MODEL,
+      qualidadeImagem: OPENAI_IMAGE_QUALITY,
+      respostas: 'OpenAI Responses API',
     },
   });
-});
-
-// ----------------------------------------------------------------
-// TESTE ISOLADO - OPENAI IMAGE LOW
-// Não altera o fluxo normal da Jisa.
-// ----------------------------------------------------------------
-
-app.post('/ia/teste-openai-imagem', async (req, res) => {
-  const inicio = Date.now();
-
-  try {
-    const prompt =
-      textoSeguro(req.body?.prompt, 5000) ||
-      textoSeguro(req.body?.mensagem, 5000) ||
-      'Crie uma sala de estar moderna, fotorrealista, com porcelanato, painel de madeira, sofá cinza e iluminação quente.';
-
-    const imagem = await gerarImagemOpenAITeste({ promptVisual: prompt });
-
-    logInfo('ia_teste_openai_imagem_ok', {
-      modelo: imagem.modelo,
-      qualidade: imagem.qualidade,
-      tamanho: imagem.tamanho,
-      duracaoMs: Date.now() - inicio,
-    });
-
-    return res.status(200).json({
-      ok: true,
-      tipo: 'imagem',
-      acao: 'teste_openai_imagem',
-      resposta: 'Imagem de teste criada pela OpenAI em qualidade Low.',
-      imagemBase64: imagem.imagemBase64,
-      mimeType: imagem.mimeType,
-      modelo: imagem.modelo,
-      qualidade: imagem.qualidade,
-      tamanho: imagem.tamanho,
-    });
-  } catch (erro) {
-    return responderErroHttp(res, erro, 'ia_teste_openai_imagem', inicio);
-  }
 });
 
 // ----------------------------------------------------------------
@@ -1111,10 +1039,13 @@ app.post('/ia/processar', async (req, res) => {
       historico: req.body?.historico,
       arquivos: req.body?.arquivos,
       imagemAnterior: req.body?.imagemAnterior,
+      previousResponseId:
+        req.body?.previousResponseId || req.body?.responseIdAnterior,
       forcarFluxoVisual: false,
     });
 
     logInfo('ia_processar_ok', {
+      provedor: 'OpenAI',
       acao: resultado.acao,
       duracaoMs: Date.now() - inicio,
     });
@@ -1133,68 +1064,30 @@ app.post('/ia/perguntar', async (req, res) => {
   const inicio = Date.now();
 
   try {
-    const mensagem = req.body?.mensagem;
-    const historico = req.body?.historico;
-    const arquivos = req.body?.arquivos;
-
-    // Mesmo no endpoint antigo, o Gemini continua sendo o cérebro.
-    // Se identificar que o pedido é visual, devolvemos uma indicação clara
-    // para o app novo usar /ia/processar. O ia_page atual ainda continuará
-    // funcionando para pedidos textuais enquanto fazemos a migração.
-    const arquivosLimpos = validarArquivos(arquivos);
-    const decisao = await decidirAcaoJisa({
-      mensagem: textoSeguro(mensagem, 12000),
-      historico,
-      arquivos: arquivosLimpos,
-      forcarImagem: false,
-      temImagemAnteriorDisponivel: Boolean(req.body?.imagemAnterior),
-    });
-
-    if (decisao.acao === 'fora_escopo') {
-      return res.status(200).json({
-        ok: true,
-        resposta: RESPOSTA_FORA_ESCOPO,
-        acao: 'fora_escopo',
-      });
-    }
-
-    if (decisao.acao === 'imagem' || decisao.acao === 'editar_imagem') {
-      // Para manter compatibilidade inclusive com versões antigas do Flutter,
-      // executamos a imagem aqui e retornamos os campos adicionais.
-      const resultado = await processarPedido({
-        mensagem,
-        historico,
-        arquivos,
-        imagemAnterior: req.body?.imagemAnterior,
-        forcarFluxoVisual: true,
-      });
-
-      return res.status(200).json(resultado);
-    }
-
-    const resposta = await responderTextoJisa({
-      mensagem: textoSeguro(mensagem, 12000),
-      historico: normalizarHistorico(historico),
-      arquivos: arquivosLimpos,
+    const resultado = await processarPedido({
+      mensagem: req.body?.mensagem,
+      historico: req.body?.historico,
+      arquivos: req.body?.arquivos,
+      imagemAnterior: req.body?.imagemAnterior,
+      previousResponseId:
+        req.body?.previousResponseId || req.body?.responseIdAnterior,
+      forcarFluxoVisual: false,
     });
 
     logInfo('ia_perguntar_ok', {
+      provedor: 'OpenAI',
+      acao: resultado.acao,
       duracaoMs: Date.now() - inicio,
     });
 
-    return res.status(200).json({
-      ok: true,
-      tipo: 'texto',
-      acao: 'texto',
-      resposta,
-    });
+    return res.status(200).json(resultado);
   } catch (erro) {
     return responderErroHttp(res, erro, 'ia_perguntar', inicio);
   }
 });
 
 // ----------------------------------------------------------------
-// COMPATIBILIDADE - ENDPOINT DE IMAGEM EXISTENTE
+// COMPATIBILIDADE - ENDPOINT VISUAL EXISTENTE
 // ----------------------------------------------------------------
 
 app.post('/ia/gerar-imagem', async (req, res) => {
@@ -1203,6 +1096,7 @@ app.post('/ia/gerar-imagem', async (req, res) => {
   try {
     const mensagem =
       textoSeguro(req.body?.mensagemAtual, 12000) ||
+      textoSeguro(req.body?.mensagem, 12000) ||
       textoSeguro(req.body?.prompt, 12000);
 
     const resultado = await processarPedido({
@@ -1210,10 +1104,13 @@ app.post('/ia/gerar-imagem', async (req, res) => {
       historico: req.body?.historico,
       arquivos: req.body?.arquivos,
       imagemAnterior: req.body?.imagemAnterior,
+      previousResponseId:
+        req.body?.previousResponseId || req.body?.responseIdAnterior,
       forcarFluxoVisual: true,
     });
 
     logInfo('ia_gerar_imagem_ok', {
+      provedor: 'OpenAI',
       acao: resultado.acao,
       duracaoMs: Date.now() - inicio,
     });
@@ -1246,7 +1143,7 @@ function responderErroHttp(res, erro, evento, inicio) {
   if (statusOriginal === 400 || statusOriginal === 413) {
     return res.status(statusOriginal).json({
       ok: false,
-      erro: textoSeguro(erro.message, 600),
+      erro: textoSeguro(erro.message, 700),
     });
   }
 
@@ -1258,10 +1155,7 @@ function responderErroHttp(res, erro, evento, inicio) {
     });
   }
 
-  if (
-    statusOriginal === 401 ||
-    statusOriginal === 403
-  ) {
+  if (statusOriginal === 401 || statusOriginal === 403) {
     return res.status(503).json({
       ok: false,
       erro:
@@ -1314,10 +1208,10 @@ app.listen(PORT, '0.0.0.0', () => {
   logInfo('servidor_iniciado', {
     porta: PORT,
     especialidade: 'construcao_civil',
-    cerebro: 'Gemini',
-    modeloPrincipal: GEMINI_MAIN_MODEL,
-    modeloFallback: GEMINI_FALLBACK_MODEL,
-    modeloImagem: GEMINI_IMAGE_MODEL,
+    provedor: 'OpenAI',
+    cerebro: OPENAI_MAIN_MODEL,
+    modeloImagem: OPENAI_IMAGE_MODEL,
+    qualidadeImagem: OPENAI_IMAGE_QUALITY,
   });
 });
 
