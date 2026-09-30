@@ -177,6 +177,9 @@ COMPORTAMENTO
 - Pergunte somente quando faltar uma informação indispensável.
 - Quando o usuário corrigir algo, aceite a correção e continue a partir dela.
 - Nunca invente informações técnicas que não saiba.
+- Em cálculos, escreva números, unidades e fórmulas em texto simples.
+- NUNCA use LaTeX, MathJax ou delimitadores matemáticos como $, $$, \( \), \[ \].
+- Exemplos corretos: "300 × 0,05 = 15 m³" e "aproximadamente 24 m³ de areia".
 - Em temas de segurança estrutural, instalações críticas, normas ou cálculos que
   dependam de inspeção/projeto, deixe claro quando for necessária validação por
   profissional habilitado, sem transformar toda resposta em aviso genérico.
@@ -201,7 +204,7 @@ IMAGENS
 `.trim();
 
 const INSTRUCAO_ORQUESTRADOR = `
-Você é o cérebro/orquestrador da Jisa, assistente do Ache Obra.
+Você é a Jisa, assistente de inteligência artificial do Ache Obra.
 
 A Jisa é especialista EXCLUSIVAMENTE em construção civil.
 Interprete semanticamente o pedido atual junto com o histórico. Não dependa de
@@ -217,6 +220,12 @@ Classifique o pedido atual em UMA ação:
 - "fora_escopo": pedido claramente fora da construção civil, exceto interação social.
 
 REGRAS:
+- Se a ação for "texto", RESPONDA também ao usuário no campo "resposta". Assim a
+  mesma chamada serve para decidir e responder, evitando uma segunda chamada à IA.
+- A resposta deve ser em português do Brasil, simples, objetiva, clara e prática.
+- Em cálculos, use somente texto simples. NUNCA use LaTeX, MathJax, $, $$, \\( \\)
+  ou \\[ \\]. Preserve números e unidades literalmente. Exemplo: 300 × 0,05 = 15 m³.
+- Se a ação for "fora_escopo", deixe "resposta" vazia.
 - Uma imagem pode conter elementos secundários fora da construção se o assunto
   principal continuar sendo construção.
 - Se o usuário enviou imagem apenas para analisar, use "texto".
@@ -234,7 +243,8 @@ Responda SOMENTE JSON válido, sem Markdown:
 {
   "acao": "texto|imagem|editar_imagem|fora_escopo",
   "promptVisual": "",
-  "motivoCurto": ""
+  "motivoCurto": "",
+  "resposta": ""
 }
 `.trim();
 
@@ -284,9 +294,26 @@ function limitarTextoPorCaracteres(texto, limite) {
 }
 
 function limparArtefatosResposta(texto) {
-  return String(texto || '')
-    .replace(/(^|\n)(\s*(?:[-*•]|\d+[.)])?\s*)\$1(?=\s)/g, '$1$2')
-    .trim();
+  let valor = String(texto || '').trim();
+
+  // Remove apenas DELIMITADORES de LaTeX/MathJax, preservando o conteúdo.
+  // Isso evita artefatos visuais no Flutter sem apagar números/unidades.
+  valor = valor
+    .replace(/\\\[([\s\S]*?)\\\]/g, '$1')
+    .replace(/\\\(([\s\S]*?)\\\)/g, '$1')
+    .replace(/\$\$([\s\S]*?)\$\$/g, '$1')
+    .replace(/\\times\b/g, '×')
+    .replace(/\\cdot\b/g, '·')
+    .replace(/\\approx\b/g, '≈')
+    .replace(/\\text\{([^{}]*)\}/g, '$1')
+    .replace(/\\mathrm\{([^{}]*)\}/g, '$1')
+    .replace(/\\,|\\;|\\!/g, ' ');
+
+  // Compatibilidade com respostas antigas que eventualmente tragam "$1"
+  // isolado no início de uma linha. Não altera valores monetários no meio do texto.
+  valor = valor.replace(/(^|\n)(\s*(?:[-*•]|\d+[.)])?\s*)\$1(?=\s)/g, '$1$2');
+
+  return valor.trim();
 }
 
 function removerCercasJson(texto) {
@@ -1058,6 +1085,8 @@ async function chamarOpenAITexto({
     },
   };
 
+  const inicioOpenAI = Date.now();
+
   logInfo('openai_texto', {
     modelo: OPENAI_MAIN_MODEL,
     arquivos: arquivos.length,
@@ -1074,6 +1103,12 @@ async function chamarOpenAITexto({
   );
 
   const texto = extrairTextoOpenAI(data);
+
+  logInfo('openai_texto_concluido', {
+    modelo: OPENAI_MAIN_MODEL,
+    duracaoMs: Date.now() - inicioOpenAI,
+    caracteresResposta: texto.length,
+  });
 
   if (!texto) {
     throw new Error('A OpenAI não retornou texto utilizável.');
@@ -1125,7 +1160,7 @@ Mesmo no endpoint visual, respeite o escopo da construção civil.
     historico: [],
     arquivos: [],
     systemInstruction: INSTRUCAO_ORQUESTRADOR,
-    maxOutputTokens: 700,
+    maxOutputTokens: 2200,
     reasoningEffort: 'low',
   });
 
@@ -1152,6 +1187,7 @@ Mesmo no endpoint visual, respeite o escopo da construção civil.
     acao,
     promptVisual: limitarTextoPorCaracteres(json.promptVisual || '', 3000),
     motivoCurto: limitarTextoPorCaracteres(json.motivoCurto || '', 300),
+    resposta: limparArtefatosResposta(json.resposta || ''),
   };
 }
 
@@ -1382,6 +1418,21 @@ async function processarPedido({
   }
 
   if (decisao.acao === 'texto') {
+    // Fluxo rápido: a mesma chamada que classificou já respondeu ao usuário.
+    // Só fazemos uma segunda chamada se, excepcionalmente, vier resposta vazia.
+    if (decisao.resposta) {
+      return {
+        ok: true,
+        tipo: 'texto',
+        acao: 'texto',
+        resposta: decisao.resposta,
+      };
+    }
+
+    logInfo('jisa_fallback_segunda_chamada_texto', {
+      motivo: 'orquestrador_retornou_resposta_vazia',
+    });
+
     const resposta = await responderTextoJisa({
       mensagem: mensagemLimpa,
       historico: historicoLimpo,
