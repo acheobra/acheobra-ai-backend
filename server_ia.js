@@ -798,7 +798,7 @@ async function buscarPlanoImagemUsuario(usuarioId) {
     plano = await supabaseSelecionarUm(
       TABELA_PLANOS_MANUAIS,
       { id: planoId },
-      'id,nome,limite_imagens_ia'
+      'id,nome_plano,limite_imagens_ia'
     );
 
     if (!plano) {
@@ -820,7 +820,7 @@ async function buscarPlanoImagemUsuario(usuarioId) {
       plano = await supabaseSelecionarUm(
         TABELA_PLANOS_MANUAIS,
         { id: planoId },
-        'id,nome,limite_imagens_ia'
+        'id,nome_plano,limite_imagens_ia'
       );
       if (plano) origemPlano = 'manual';
     }
@@ -845,10 +845,7 @@ async function buscarPlanoImagemUsuario(usuarioId) {
     Number.parseInt(plano.limite_imagens_ia, 10) || 0
   );
 
-  const nomePlanoBanco =
-    origemPlano === 'manual'
-      ? plano.nome
-      : plano.nome_plano;
+  const nomePlanoBanco = plano.nome_plano;
 
   logInfo('plano_ia_identificado', {
     usuarioId,
