@@ -111,6 +111,7 @@ const CONTROLE_IMAGENS_CONFIGURADO = Boolean(
 
 const TABELA_USUARIOS = 'tab_usuarios';
 const TABELA_PLANOS = 'tab_planos';
+const TABELA_PLANOS_MANUAIS = 'tab_planos_manuais';
 const RPC_RESERVAR_IMAGEM_IA = 'reservar_imagem_ia';
 const RPC_ESTORNAR_IMAGEM_IA = 'estornar_imagem_ia';
 
@@ -774,29 +775,98 @@ async function buscarPlanoImagemUsuario(usuarioId) {
     throw erro;
   }
 
-  const plano = await supabaseSelecionarUm(
-    TABELA_PLANOS,
-    { id: planoId },
-    'id,nome_plano,limite_imagens_ia'
-  );
+  const nomePlanoAtivo = textoSeguro(usuario.nome_plano_ativo, 200);
+  const nomeNormalizado = nomePlanoAtivo
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  const nomesPlanosManuais = new Set([
+    'teste',
+    'cortesia',
+    'parceria',
+    'especial',
+  ]);
+
+  const ehPlanoManual = nomesPlanosManuais.has(nomeNormalizado);
+
+  let plano = null;
+  let origemPlano = ehPlanoManual ? 'manual' : 'normal';
+
+  if (ehPlanoManual) {
+    plano = await supabaseSelecionarUm(
+      TABELA_PLANOS_MANUAIS,
+      { id: planoId },
+      'id,nome,limite_imagens_ia'
+    );
+
+    if (!plano) {
+      plano = await supabaseSelecionarUm(
+        TABELA_PLANOS,
+        { id: planoId },
+        'id,nome_plano,limite_imagens_ia'
+      );
+      if (plano) origemPlano = 'normal';
+    }
+  } else {
+    plano = await supabaseSelecionarUm(
+      TABELA_PLANOS,
+      { id: planoId },
+      'id,nome_plano,limite_imagens_ia'
+    );
+
+    if (!plano) {
+      plano = await supabaseSelecionarUm(
+        TABELA_PLANOS_MANUAIS,
+        { id: planoId },
+        'id,nome,limite_imagens_ia'
+      );
+      if (plano) origemPlano = 'manual';
+    }
+  }
 
   if (!plano) {
+    logInfo('plano_ia_nao_encontrado', {
+      usuarioId,
+      planoId: String(planoId),
+      nomePlanoAtivo,
+      origemEsperada: ehPlanoManual ? 'manual' : 'normal',
+    });
+
     const erro = new Error('O plano ativo do usuário não foi encontrado.');
     erro.statusCode = 403;
     erro.codigo = 'PLANO_NAO_ENCONTRADO';
     throw erro;
   }
 
-  const limite = Math.max(0, Number.parseInt(plano.limite_imagens_ia, 10) || 0);
+  const limite = Math.max(
+    0,
+    Number.parseInt(plano.limite_imagens_ia, 10) || 0
+  );
+
+  const nomePlanoBanco =
+    origemPlano === 'manual'
+      ? plano.nome
+      : plano.nome_plano;
+
+  logInfo('plano_ia_identificado', {
+    usuarioId,
+    planoId: plano.id,
+    origemPlano,
+    nomePlano: textoSeguro(nomePlanoBanco || nomePlanoAtivo || 'Plano', 200),
+    limiteImagensIa: limite,
+  });
 
   return {
     usuarioId,
     planoId: plano.id,
     nomePlano: textoSeguro(
-      plano.nome_plano || usuario.nome_plano_ativo || 'Plano',
+      nomePlanoBanco || nomePlanoAtivo || 'Plano',
       200
     ),
     limite,
+    origemPlano,
   };
 }
 
