@@ -310,8 +310,27 @@ function limitarTextoPorCaracteres(texto, limite) {
   return valor.length <= limite ? valor : valor.slice(0, limite).trim();
 }
 
+// DIAGNOSTICO TEMPORARIO DE FORMATACAO DA JISA.
+// Registra apenas contagens e posicoes, nunca textos, anexos ou dados pessoais.
+// Compare os eventos com o mesmo responseId no painel Logs do Render.
+function diagnosticarCifraoJisa(etapa, texto, responseId = '') {
+  const valor = String(texto ?? '');
+  const posicoes = [...valor.matchAll(/\$1(?!\d)/g)].map((m) => m.index);
+  const outrosCifroes = [...valor.matchAll(/\$(?!1(?!\d))/g)].length;
+  logInfo('jisa_diagnostico_cifrao', {
+    etapa,
+    responseId: textoSeguro(responseId, 100) || 'sem_response_id',
+    caracteres: valor.length,
+    ocorrenciasLiteralDolar1: posicoes.length,
+    primeirasPosicoesDolar1: posicoes.slice(0, 12),
+    outrosCifroes,
+    // Sem amostras da resposta para proteger informacoes do usuario.
+  });
+}
+
 function limparArtefatosResposta(texto) {
   let valor = String(texto || '').trim();
+  diagnosticarCifraoJisa('entrada_limpeza', valor);
 
   // Remove somente os delimitadores de LaTeX/MathJax.
   // A função de substituição preserva o conteúdo capturado literalmente.
@@ -333,6 +352,7 @@ function limparArtefatosResposta(texto) {
     (_trecho, inicio, prefixo) => inicio + prefixo
   );
 
+  diagnosticarCifraoJisa('saida_limpeza', valor);
   return valor.trim();
 }
 
@@ -1190,6 +1210,7 @@ async function chamarOpenAITexto({
   );
 
   const texto = extrairTextoOpenAI(data);
+  diagnosticarCifraoJisa('resposta_bruta_openai', texto, data?.id);
 
   logInfo('openai_texto_concluido', {
     modelo: OPENAI_MAIN_MODEL,
@@ -1252,6 +1273,9 @@ Mesmo no endpoint visual, respeite o escopo da construção civil.
   });
 
   const json = extrairJsonObjeto(resposta.texto);
+  if (json && typeof json.resposta === 'string') {
+    diagnosticarCifraoJisa('campo_resposta_orquestrador', json.resposta, resposta.responseId);
+  }
 
   if (!json) {
     throw new Error('A OpenAI não retornou uma decisão de ação válida.');
@@ -1445,8 +1469,11 @@ async function responderTextoJisa({
       : '',
   });
 
+  const textoFormatado = limparArtefatosResposta(resposta.texto);
+  diagnosticarCifraoJisa('resposta_formatada_anexos', textoFormatado, resposta.responseId);
+
   return {
-    texto: limparArtefatosResposta(resposta.texto),
+    texto: textoFormatado,
     responseId: resposta.responseId,
   };
 }
@@ -1709,6 +1736,10 @@ app.post('/ia/processar', async (req, res) => {
       duracaoMs: Date.now() - inicio,
     });
 
+    if (resultado?.tipo === 'texto') {
+      diagnosticarCifraoJisa('resposta_enviada_flutter', resultado.resposta, resultado.responseId);
+    }
+
     return res.status(200).json(resultado);
   } catch (erro) {
     return responderErroHttp(res, erro, 'ia_processar', inicio);
@@ -1739,6 +1770,10 @@ app.post('/ia/perguntar', async (req, res) => {
       acao: resultado.acao,
       duracaoMs: Date.now() - inicio,
     });
+
+    if (resultado?.tipo === 'texto') {
+      diagnosticarCifraoJisa('resposta_enviada_flutter', resultado.resposta, resultado.responseId);
+    }
 
     return res.status(200).json(resultado);
   } catch (erro) {
@@ -1775,6 +1810,10 @@ app.post('/ia/gerar-imagem', async (req, res) => {
       acao: resultado.acao,
       duracaoMs: Date.now() - inicio,
     });
+
+    if (resultado?.tipo === 'texto') {
+      diagnosticarCifraoJisa('resposta_enviada_flutter', resultado.resposta, resultado.responseId);
+    }
 
     return res.status(200).json(resultado);
   } catch (erro) {
