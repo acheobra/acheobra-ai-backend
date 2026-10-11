@@ -178,6 +178,8 @@ COMPORTAMENTO
 - Pergunte somente quando faltar uma informação indispensável.
 - Quando o usuário corrigir algo, aceite a correção e continue a partir dela.
 - Nunca invente informações técnicas que não saiba.
+- Nunca use o marcador literal "$1" como nome de ambiente, item ou título.
+- Identifique os ambientes por seus nomes reais (quarto, banheiro, sala etc.) quando legíveis.
 - Em cálculos, escreva números, unidades e fórmulas em texto simples.
 - NUNCA use LaTeX, MathJax ou delimitadores matemáticos como $, $$, \( \), \[ \].
 - Exemplos corretos: "300 × 0,05 = 15 m³" e "aproximadamente 24 m³ de areia".
@@ -311,22 +313,25 @@ function limitarTextoPorCaracteres(texto, limite) {
 function limparArtefatosResposta(texto) {
   let valor = String(texto || '').trim();
 
-  // Remove apenas DELIMITADORES de LaTeX/MathJax, preservando o conteúdo.
-  // Isso evita artefatos visuais no Flutter sem apagar números/unidades.
+  // Remove somente os delimitadores de LaTeX/MathJax.
+  // A função de substituição preserva o conteúdo capturado literalmente.
   valor = valor
-    .replace(/\\\[([\s\S]*?)\\\]/g, '$1')
-    .replace(/\\\(([\s\S]*?)\\\)/g, '$1')
-    .replace(/\$\$([\s\S]*?)\$\$/g, '$1')
+    .replace(/\\\[([\s\S]*?)\\\]/g, (_trecho, conteudo) => conteudo)
+    .replace(/\\\(([\s\S]*?)\\\)/g, (_trecho, conteudo) => conteudo)
+    .replace(/\$\$([\s\S]*?)\$\$/g, (_trecho, conteudo) => conteudo)
     .replace(/\\times\b/g, '×')
     .replace(/\\cdot\b/g, '·')
     .replace(/\\approx\b/g, '≈')
-    .replace(/\\text\{([^{}]*)\}/g, '$1')
-    .replace(/\\mathrm\{([^{}]*)\}/g, '$1')
+    .replace(/\\text\{([^{}]*)\}/g, (_trecho, conteudo) => conteudo)
+    .replace(/\\mathrm\{([^{}]*)\}/g, (_trecho, conteudo) => conteudo)
     .replace(/\\,|\\;|\\!/g, ' ');
 
-  // Compatibilidade com respostas antigas que eventualmente tragam "$1"
-  // isolado no início de uma linha. Não altera valores monetários no meio do texto.
-  valor = valor.replace(/(^|\n)(\s*(?:[-*•]|\d+[.)])?\s*)\$1(?=\s)/g, '$1$2');
+  // Corrige o artefato literal "$1" no início de linhas e de itens.
+  // Não altera preços ou valores monetários dentro de frases.
+  valor = valor.replace(
+    /(^|\n)([ \t]*(?:(?:[-*•]|\d+[.)])[ \t]*)?)\$1(?=[ \t]|$)/g,
+    (_trecho, inicio, prefixo) => inicio + prefixo
+  );
 
   return valor.trim();
 }
