@@ -133,7 +133,7 @@ const OPENAI_IMAGE_QUALITY = String(
 const MAX_HISTORICO = 14;
 const MAX_ARQUIVOS = 5;
 const MAX_ARQUIVO_BYTES = 18 * 1024 * 1024;
-const TIMEOUT_OPENAI_MS = 90000;
+const TIMEOUT_OPENAI_MS = 150000;
 const TIMEOUT_IMAGEM_MS = 180000;
 
 const RESPOSTA_FORA_ESCOPO =
@@ -185,8 +185,22 @@ COMPORTAMENTO
   dependam de inspeção/projeto, deixe claro quando for necessária validação por
   profissional habilitado, sem transformar toda resposta em aviso genérico.
 
-CONTEXTO
-- Use o histórico recente para compreender referências como:
+ ANÁLISE DE IMAGENS E DOCUMENTOS
+ - Quando receber uma fotografia, planta baixa, projeto, croqui ou documento,
+   EXAMINE o conteúdo real do anexo antes de responder. Não se limite a dizer
+   "recebi a imagem" ou perguntar genericamente o que deve analisar.
+ - Se o pedido for "analise esta imagem" ou "analise este PDF", comece com uma
+   análise objetiva do que está visível: tipo de documento, ambientes, elementos,
+   textos e cotas legíveis, observações técnicas pertinentes e limitações.
+ - Em plantas, diferencie medidas escritas e medidas estimadas. Nunca invente
+   dimensões, quantitativos, escala, normas ou conclusões estruturais.
+ - Em PDFs, considere tanto o texto quanto desenhos, tabelas e imagens quando
+   estiverem acessíveis. Se algum detalhe não estiver legível, identifique-o.
+ - Não afirme ter lido páginas ou elementos que não estejam disponíveis.
+ - Pergunte por detalhes somente quando forem indispensáveis para continuar.
+
+ CONTEXTO
+ - Use o histórico recente para compreender referências como:
   "ela", "essa casa", "a anterior", "como pedi", "igual à anterior",
   "de verdade", "mais realista", "mude isso", "agora", "que pedi",
   "que descrevi", "que falei", "que mencionei".
@@ -1109,6 +1123,7 @@ function montarInputOpenAI({
       conteudoAtual.push({
         type: 'input_image',
         image_url: dataUrlArquivo(arquivo),
+        detail: 'high',
       });
     } else {
       // Documentos são enviados como data URL pelo input_file.
@@ -1416,8 +1431,13 @@ async function responderTextoJisa({
     historico,
     arquivos,
     systemInstruction: INSTRUCAO_SISTEMA,
-    maxOutputTokens: 2200,
-    reasoningEffort: 'low',
+    maxOutputTokens: arquivos.length > 0 ? 4500 : 2200,
+    reasoningEffort: arquivos.length > 0 ? 'medium' : 'low',
+    instrucaoExtra: arquivos.length > 0
+      ? 'Os arquivos reais estão anexados a esta mensagem. Analise-os diretamente. ' +
+        'Identifique o que está efetivamente visível ou legível e responda ao pedido ' +
+        'sem perguntas genéricas. Não invente detalhes ilegíveis.'
+      : '',
   });
 
   return {
@@ -1442,6 +1462,13 @@ async function processarPedido({
   const mensagemLimpa = textoSeguro(mensagem, 12000);
   const historicoLimpo = normalizarHistorico(historico);
   const arquivosLimpos = validarArquivos(arquivos);
+  if (arquivosLimpos.length > 0) {
+    logInfo('jisa_anexos_recebidos', {
+      quantidade: arquivosLimpos.length,
+      tipos: arquivosLimpos.map((a) => a.mimeType),
+      tamanhosBytes: arquivosLimpos.map((a) => a.bytes),
+    });
+  }
   const imagemAnteriorLimpa = imagemAnterior
     ? validarArquivos([imagemAnterior])[0]
     : null;
@@ -1485,9 +1512,11 @@ async function processarPedido({
   }
 
   if (decisao.acao === 'texto') {
-    // Fluxo rápido: a mesma chamada que classificou já respondeu ao usuário.
-    // Só fazemos uma segunda chamada se, excepcionalmente, vier resposta vazia.
-    if (decisao.resposta) {
+    // IMPORTANTE: o orquestrador recebe somente o RESUMO dos anexos, não seus
+    // bytes. Portanto, sua resposta nunca pode substituir a leitura de anexos.
+    // Com arquivos, obrigatoriamente chamamos o modelo com imagem/PDF real.
+    // Sem arquivos, preservamos a resposta rápida já existente.
+    if (decisao.resposta && arquivosLimpos.length === 0) {
       return {
         ok: true,
         tipo: 'texto',
@@ -1497,7 +1526,9 @@ async function processarPedido({
     }
 
     logInfo('jisa_fallback_segunda_chamada_texto', {
-      motivo: 'orquestrador_retornou_resposta_vazia',
+      motivo: arquivosLimpos.length > 0
+        ? 'analisar_anexos_reais'
+        : 'orquestrador_retornou_resposta_vazia',
     });
 
     const resposta = await responderTextoJisa({
