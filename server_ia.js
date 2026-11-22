@@ -130,7 +130,7 @@ const OPENAI_IMAGE_QUALITY = String(
   process.env.OPENAI_IMAGE_QUALITY || 'low'
 ).trim().toLowerCase();
 
-const MAX_HISTORICO = 14;
+const MAX_HISTORICO = 10;
 const MAX_ARQUIVOS = 5;
 const MAX_ARQUIVO_BYTES = 18 * 1024 * 1024;
 const TIMEOUT_OPENAI_MS = 150000;
@@ -509,7 +509,7 @@ function normalizarHistorico(historico) {
 
       return {
         role,
-        content: textoSeguro(item?.content || item?.texto || '', 7000),
+        content: textoSeguro(item?.content || item?.texto || '', 3500),
         teveImagemGerada: item?.teveImagemGerada === true,
       };
     })
@@ -1174,7 +1174,7 @@ async function chamarOpenAITexto({
   arquivos = [],
   systemInstruction = INSTRUCAO_SISTEMA,
   instrucaoExtra = '',
-  maxOutputTokens = 1800,
+  maxOutputTokens = 1200,
   reasoningEffort = 'low',
 }) {
   const corpo = {
@@ -1478,6 +1478,33 @@ async function responderTextoJisa({
   };
 }
 
+// Detecta somente pedidos visuais explícitos. Conversas e dúvidas comuns
+// seguem diretamente para a resposta textual, sem pagar a latência de uma
+// chamada extra de classificação. Pedidos visuais continuam no orquestrador.
+function pedidoVisualExplicito(mensagem, historico = [], arquivos = []) {
+  const texto = String(mensagem || '').toLowerCase().normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  const criarImagem =
+    /\b(crie|criar|gere|gerar|faca|fazer|desenhe|desenhar|renderize|renderizar|produza|produzir|monte|montar)\b.{0,55}\b(imagem|foto|fotografia|ilustracao|render|visual|fachada|planta|projeto 3d)\b/.test(texto) ||
+    /\b(imagem|foto|fotografia|ilustracao|render)\b.{0,35}\b(de|da|do|para|mostrando)\b/.test(texto);
+
+  const editarImagem =
+    /\b(edite|editar|altere|alterar|modifique|modificar|mude|troque|substitua|remova|adicione)\b.{0,70}\b(imagem|foto|fotografia|fachada|piso|parede|janela|porta|telhado|garagem|cor)\b/.test(texto) ||
+    /\b(mais realista|mostre por dentro|agora por dentro|coloque uma garagem|troque o piso)\b/.test(texto);
+
+  const referenciaVisualAnterior =
+    /\b(mais realista|agora mostre|mostre por dentro|troque|mude|coloque|adicione|remova|substitua)\b/.test(texto) &&
+    historico.some((item) => item?.teveImagemGerada === true);
+
+  // Se o usuário enviou imagem e pede edição explicitamente, continua visual.
+  const imagemEnviada = Array.isArray(arquivos) &&
+    arquivos.some((arquivo) => arquivo?.ehImagem === true);
+
+  return criarImagem || editarImagem || referenciaVisualAnterior ||
+    (imagemEnviada && /\b(edite|editar|mude|alterar|modifique|troque|adicione|remova)\b/.test(texto));
+}
+
 // ----------------------------------------------------------------
 // PROCESSAMENTO CENTRAL
 // ----------------------------------------------------------------
@@ -1517,6 +1544,34 @@ async function processarPedido({
     const erro = new Error('Envie uma mensagem ou pelo menos um arquivo.');
     erro.statusCode = 400;
     throw erro;
+  }
+
+  // Caminho rápido: texto e análise de anexos não precisam passar primeiro
+  // por outra chamada da IA para descobrir que são pedidos textuais.
+  // O classificador semântico permanece ativo para pedidos visuais/ambíguos.
+  const precisaOrquestrador =
+    forcarFluxoVisual ||
+    pedidoVisualExplicito(mensagemLimpa, historicoLimpo, arquivosLimpos);
+
+  if (!precisaOrquestrador) {
+    logInfo('jisa_caminho_rapido_texto', {
+      arquivos: arquivosLimpos.length,
+      historico: historicoLimpo.length,
+    });
+
+    const respostaRapida = await responderTextoJisa({
+      mensagem: mensagemLimpa,
+      historico: historicoLimpo,
+      arquivos: arquivosLimpos,
+    });
+
+    return {
+      ok: true,
+      tipo: 'texto',
+      acao: 'texto',
+      resposta: respostaRapida.texto,
+      responseId: respostaRapida.responseId,
+    };
   }
 
   const decisao = await decidirAcaoJisa({
